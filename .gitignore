@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Simulation outputs (results/ chỉ giữ .gitkeep khi chưa có dữ liệu chốt)
+results/*.csv
+results/*.png
+results/*.svg
+results/*.log
+!results/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
