@@ -121,17 +121,36 @@ class TestEventsAndKernelBoundary(unittest.TestCase):
             {"completed", "timeout", "db_drop", "dropped"},
         )
 
-    def test_kernel_absence_is_reported_not_hidden(self) -> None:
-        # Máy hiện tại chưa có bkitevsim → adapter phải báo rõ, không crash khi import.
-        if is_available():
-            self.skipTest("bkitevsim đã được cài; test này chỉ kiểm nhánh thiếu kernel")
-        reason = unavailable_reason()
-        self.assertIsNotNone(reason)
-        self.assertIn("bkitevsim", reason)
+    def test_kernel_adapter_matches_api_and_reports_absence(self) -> None:
         from spe_sim.core import kernel
 
-        with self.assertRaises(KernelUnavailable):
-            kernel.make_event(timestamp=0.0, source=None, destination=None, payload=None)
+        if not is_available():
+            # Nhánh thiếu kernel: adapter phải báo rõ, không crash khi import.
+            reason = unavailable_reason()
+            self.assertIsNotNone(reason)
+            self.assertIn("bkitevsim", reason)
+            with self.assertRaises(KernelUnavailable):
+                kernel.make_event(
+                    timestamp=0.0,
+                    sender_id=0,
+                    receiver_id=1,
+                    event_type="REQ_ARRIVAL",
+                    payload=None,
+                )
+            return
+
+        # Nhánh có kernel: `Event` thật dùng id số, không phải tên LP.
+        event = kernel.make_event(
+            timestamp=1.5,
+            sender_id=0,
+            receiver_id=1,
+            event_type="REQ_ARRIVAL",
+            payload={"a": 1},
+        )
+        self.assertEqual(event.timestamp, 1.5)
+        self.assertEqual((event.sender_id, event.receiver_id), (0, 1))
+        self.assertEqual(event.event_type, "REQ_ARRIVAL")
+        self.assertEqual(event.payload, {"a": 1})
 
 
 class TestRng(unittest.TestCase):

@@ -14,7 +14,7 @@ nhưng vẫn chạy tiếp các event đang có trong queue tới khi rỗng.
 from __future__ import annotations
 
 import random
-from typing import Final
+from typing import Final, Iterator
 
 from spe_sim.core.config import LP_ADMISSION
 from spe_sim.core.events import Emission, ReqArrival
@@ -71,6 +71,15 @@ class SourceLP:
             destination=LP_ADMISSION,
             payload=ReqArrival(request_id=request_id, t_arrive=t),
         )
+
+    def stream(self) -> Iterator[Emission]:
+        """Phát toàn bộ khách trong `[0, T_sim]` — hook cho `LogicalProcessAdapter.initialize()`.
+
+        Nguồn không phụ thuộc trạng thái hệ thống, nên nạp trước toàn bộ event là tương đương
+        với sinh dần; đổi lại driver không cần gọi `peek()/take()` bằng tay.
+        """
+        while (t := self.peek()) is not None:
+            yield self.take()
 
     def reset(self) -> None:
         """Đưa nguồn về trạng thái đầu (dùng cho test tái lập)."""
