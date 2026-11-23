@@ -85,6 +85,8 @@ class BkSysCoSocketLP(BkSysCoLogicalProcess):
         self.app_lp_id = app_lp_id
         self.max_buffer_size = max_buffer_size
         self._scheduled_arrivals: List[tuple] = []
+        # [FIX-5] counter shared with handle_event (was a never-incremented local)
+        self.arrivals_processed = 0
     
     def add_arrival(self, timestamp: float, data: str) -> None:
         """Pre-schedule a network data arrival."""
@@ -124,15 +126,15 @@ class BkSysCoSocketLP(BkSysCoLogicalProcess):
         # Track expected arrivals to know when to terminate
         expected_arrivals = sum(1 for t, _ in self._scheduled_arrivals
                         if t < self._event_loop.end_time)
-        arrivals_processed = 0
+        self.arrivals_processed = 0
         
         # Just wait until simulation ends - all event processing is in handle_event
         while self._event_loop and self._event_loop.current_time < self._event_loop.end_time:
             # If all scheduled arrivals have been processed and buffer is empty, we can terminate
-            if arrivals_processed >= expected_arrivals and not self.state.buffer:
+            if self.arrivals_processed >= expected_arrivals and not self.state.buffer:
                 # Give a small grace period for any pending acks
                 await self.advance_time(0.01)
-                if not self.state.buffer and arrivals_processed >= expected_arrivals:
+                if not self.state.buffer and self.arrivals_processed >= expected_arrivals:
                     logger.info(f"Socket LP {self.lp_id}: All arrivals processed and buffer empty, terminating")
                     await self.advance_time(0.01)
                     break
@@ -171,6 +173,9 @@ class BkSysCoSocketLP(BkSysCoLogicalProcess):
         else:
             self.state.stats['dropped'] += 1
             logger.warning(f"Socket {self.lp_id}: Buffer full, dropped '{data}'")
+
+        # [FIX-5] packet handled (pushed or dropped) -> lets coroutine_run terminate
+        self.arrivals_processed += 1
     
     def _handle_app_ack(self, event: Event) -> None:
         """Handle acknowledgment from application."""
@@ -219,7 +224,10 @@ class BkSysCoAppLP(BkSysCoLogicalProcess):
         # Just wait until simulation ends or max events processed
         while events_processed < self.max_events and self._event_loop and \
               self._event_loop.current_time < self._event_loop.end_time:
-            await self.advance_time(0.1)  # Yield control periodically
+            # Yield control periodically; clamp to end_time so float drift (0.1*k)
+            # never parks a timer beyond the horizon (would strand this LP)
+            remaining = self._event_loop.end_time - self._event_loop.current_time
+            await self.advance_time(min(0.1, remaining))
             
             # Check if we've processed enough events
             events_processed = self.state.stats['processed']

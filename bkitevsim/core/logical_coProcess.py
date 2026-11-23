@@ -12,6 +12,16 @@ BkSys Co-Simulation Logical Process and Event Loop for PDES.
 
 This module provides the BkSysCoLogicalProcess base class and BkSysCoEventLoop
 for coroutine-based simulation using cooperative multitasking.
+
+Dev 1 fixes (group XX-004679A):
+  [FIX-1] undefined name EVENT_TIMEOUT_ERROR -> TIMEOUT_ERROR.
+  [FIX-2] end-of-run check inverted: ``if not alive_lps`` logs completion,
+          otherwise a warning lists the stranded LPs.
+  [FIX-3] timeouts of wait_for_event / wait_for_multiple are Virtual Time
+          timers on ``_time_waiters`` (no more asyncio.wait_for / asyncio.wait
+          with a wall-clock timeout).  Cancelled timers are discarded so they
+          never move the virtual clock.
+  [FIX-4] run() uses asyncio.Runner instead of asyncio.run().
 """
 from __future__ import annotations
 import time
@@ -183,7 +193,27 @@ class BkSysCoEventLoop:
             A new BkSysFuture instance.
         """
         return BkSysFuture()
-    
+
+    def schedule_virtual_timer(self, lp_id: int, delay: float) -> BkSysFuture:
+        """Arm a Virtual Time timer that resolves after ``delay`` simulated seconds.  [FIX-3]
+
+        The timer lives on ``_time_waiters`` like any wait_until_time() waiter.
+        Cancel the returned future to disarm it.
+
+        Args:
+            lp_id: ID of the LP that owns the timer.
+            delay: Virtual-time delay in seconds (must be non-negative).
+
+        Returns:
+            Future resolved with the virtual time at which the timer fired.
+        """
+        if delay < 0:
+            raise ValueError("Timeout must be non-negative")
+        timer = self.create_future()
+        deadline = self._current_time + delay
+        self._time_waiters.push((deadline, lp_id, timer), priority=deadline)
+        return timer
+
     async def wait_for_event(self, lp_id: int, event_type: str, timeout: float = None) -> Event:
         """Coroutine wait for a specific event type.
         Elaspse time control until an event of the given type arrives.
@@ -191,11 +221,11 @@ class BkSysCoEventLoop:
         Args:
             lp_id: ID of the LP waiting for the event.
             event_type: Type of event to wait for.
-            timeout: Optional timeout in seconds.
-            
+            timeout: Optional timeout in virtual-time seconds.
+
         Returns:
             The received event.
-            
+
         Raises:
             TIMEOUT_ERROR: If timeout expires before event arrives.
         """
@@ -203,12 +233,19 @@ class BkSysCoEventLoop:
         self._event_waiters[event_type].append((lp_id, future))
         self._lp_status[lp_id] = BkSysCoLPStatus.WAITING_EVENT
         self._lp_waiting_for[lp_id] = event_type
-        
+
+        timer = None
+        if timeout is not None:
+            # [FIX-3] Virtual Time timeout: when the timer fires, fail the event future
+            timer = self.schedule_virtual_timer(lp_id, timeout)
+
+            def _expire(t, fut=future):
+                if not t.cancelled() and not fut.done():
+                    fut.set_exception(TIMEOUT_ERROR())
+            timer.add_done_callback(_expire)
+
         try:
-            if timeout:
-                event = await asyncio.wait_for(future, timeout=timeout)
-            else:
-                event = await future
+            event = await future
             self._lp_status[lp_id] = BkSysCoLPStatus.READY
             return event
         except TIMEOUT_ERROR:
@@ -216,7 +253,12 @@ class BkSysCoEventLoop:
             # Remove from waiters
             waiters = self._event_waiters[event_type]
             self._event_waiters[event_type] = [(lid, f) for lid, f in waiters if lid != lp_id]
-            raise EVENT_TIMEOUT_ERROR(f"Timeout waiting for event type '{event_type}'")
+            # [FIX-1] was the undefined name EVENT_TIMEOUT_ERROR
+            raise TIMEOUT_ERROR(f"Timeout waiting for event type '{event_type}' "
+                                f"(virtual t={self._current_time})") from None
+        finally:
+            if timer is not None and not timer.done():
+                timer.cancel()
     
     async def wait_until_time(self, lp_id: int, target_time: float) -> float:
         """Coroutine wait until virtual time reaches target_time.
@@ -283,6 +325,13 @@ class BkSysCoEventLoop:
         if next_event_time is None and hasattr(self._event_queue, '_heap') and self._event_queue._heap:
             next_event_time = self._event_queue._heap[0][0]
         
+        # [FIX-3] Drop disarmed (cancelled) timers so they never advance the clock
+        while not self._time_waiters.is_empty():
+            head = self._time_waiters.peek()
+            if head is None or not head[2].done():
+                break
+            self._time_waiters.pop()
+
         next_waiter_time = None
         if not self._time_waiters.is_empty():
             next_waiter = self._time_waiters.peek()
@@ -377,7 +426,9 @@ class BkSysCoEventLoop:
         Returns:
             Dictionary with simulation statistics.
         """
-        return asyncio.run(self._run_async(max_iterations))
+        # [FIX-4] asyncio.Runner (Python >= 3.11) instead of asyncio.run()
+        with asyncio.Runner() as runner:
+            return runner.run(self._run_async(max_iterations))
     
     async def _run_async(self, max_iterations: int = None) -> tp.Dict:
         """Async implementation of the event loop.
@@ -445,7 +496,7 @@ class BkSysCoEventLoop:
                 if not time_advanced:
                     alive_lps = [lp_id for lp_id, status in self._lp_status.items()
                              if status != BkSysCoLPStatus.TERMINATED]
-                    if alive_lps:
+                    if not alive_lps:  # [FIX-2] condition was inverted
                         logger.info("All LPs terminated - simulation complete")
                     else:
                         logger.warning(
@@ -623,7 +674,7 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
         
         Args:
             event_type: Type of event to wait for.
-            timeout: Optional timeout in wall-clock seconds.
+            timeout: Optional timeout in virtual-time seconds.
             
         Returns:
             The received event.
@@ -657,7 +708,7 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
         
         Args:
             event_types: List of event types to wait for.
-            timeout: Optional timeout in wall-clock seconds.
+            timeout: Optional timeout in virtual-time seconds.
             
         Returns:
             The first received event.
@@ -685,14 +736,23 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
         self._event_loop._lp_status[self.lp_id] = BkSysCoLPStatus.WAITING_EVENT
         self._event_loop._lp_waiting_for[self.lp_id] = event_types
         
+        # [FIX-3] Virtual Time timer instead of asyncio.wait(..., timeout=<wall-clock>)
+        timer = None
+        if timeout is not None:
+            timer = self._event_loop.schedule_virtual_timer(self.lp_id, timeout)
+
         try:
             # Extract future objects
             future_objects = [f for _, f in futures]
-            if timeout:
-                done, pending = await asyncio.wait(future_objects, timeout=timeout, return_when=FIRST_COMPLETED)
-            else:
-                done, pending = await asyncio.wait(future_objects, return_when=FIRST_COMPLETED)
-            
+            wait_set = future_objects + ([timer] if timer is not None else [])
+            done, pending = await asyncio.wait(wait_set, return_when=FIRST_COMPLETED)
+            if timer is not None:
+                timed_out = timer in done and not any(f in done for f in future_objects)
+                done.discard(timer)
+                if timed_out:
+                    raise TIMEOUT_ERROR(f"Timeout waiting for event types {event_types} "
+                                        f"(virtual t={self._event_loop.current_time})")
+
             # Cancel pending futures
             for et, future in futures:
                 if future not in done:
@@ -725,9 +785,13 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
         except TIMEOUT_ERROR:
             self._event_loop._lp_status[self.lp_id] = BkSysCoLPStatus.READY
             for et, future in futures:
+                future.cancel()
                 waiters = self._event_loop._event_waiters[et]
                 self._event_loop._event_waiters[et] = [(lid, f) for lid, f in waiters if lid != self.lp_id]
             raise
+        finally:
+            if timer is not None and not timer.done():
+                timer.cancel()
     
     # Abstract method implementations
     def initialize(self) -> None:
