@@ -92,10 +92,30 @@ class SubResp:
 
 @dataclass(slots=True)
 class TimeoutAlarm:
-    """SLA timer của Dispatcher: đặt tại t_arrive + T_timeout."""
+    """SLA timer của Dispatcher: đặt tại t_arrive + T_timeout.
+
+    `deferred` giải quyết K11 (`report.md` §6): khi alarm nổ **đúng** mốc deadline, nó tự
+    phát lại một alarm cùng timestamp (xếp sau mọi response đã có trong queue — LadderQueue
+    FIFO theo thứ tự push). Nhờ vậy response về đúng `r = T_timeout` được xử lý trước, khớp
+    spec §1.3 "r ≤ T_timeout là completed".
+    """
 
     request_id: int
     t_deadline: float
+    deferred: bool = False
+
+
+@dataclass(slots=True)
+class CpuTimer:
+    """Timer nội bộ của Dispatcher cho hai pha CPU (spec §3.1).
+
+    kind = "ingress"  → hết pha 1 (ingress + fan-out), bắt đầu phát I/O,
+    kind = "callback" → hết pha 2 (join callback), chốt kết cục.
+    Không gửi cho LP khác; không nằm trong `EVENT_TYPES`.
+    """
+
+    request_id: int
+    kind: str
 
 
 @dataclass(slots=True)
@@ -133,7 +153,16 @@ class OutcomeNotice:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-Payload = ReqArrival | Admitted | SubReq | SubResp | JobDone | TimeoutAlarm | OutcomeNotice
+Payload = (
+    ReqArrival
+    | Admitted
+    | SubReq
+    | SubResp
+    | JobDone
+    | TimeoutAlarm
+    | CpuTimer
+    | OutcomeNotice
+)
 
 
 @dataclass(frozen=True, slots=True)
