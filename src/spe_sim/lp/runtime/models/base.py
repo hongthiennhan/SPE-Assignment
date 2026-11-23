@@ -81,6 +81,30 @@ class RuntimeModel:
             **kwargs,
         )
 
+    def build_coroutine_dispatcher(
+        self,
+        join_mode: JoinMode,
+        *,
+        rng: random.Random | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Bản **asyncio** của dispatcher (spec §1.1.2) — cùng profile, cùng kết quả số."""
+        from spe_sim.lp.runtime.coroutine_dispatcher import CoroutineDispatcherLP
+
+        if (self.p_pin > 0.0 or self.p_uv > 0.0) and rng is None:
+            raise ValueError(
+                f"{self.model_name}: cần `rng` khi p_pin/p_uv > 0 để chạy lại cùng seed "
+                "cho kết quả trùng (DEV.md §3)"
+            )
+        return CoroutineDispatcherLP(
+            self.profile,
+            join_mode,
+            pin_probability=self.p_pin if self.supports_pin else 0.0,
+            uv_probability=self.p_uv if self.supports_uv else 0.0,
+            rng=rng,
+            **kwargs,
+        )
+
     def describe(self) -> dict[str, Any]:
         profile = self.profile
         return {

@@ -13,6 +13,8 @@ API THẬT (đọc từ `vendor/bkitevsim`, KHÔNG sửa một dòng nào)
     bkitevsim.queues.LadderQueue(bucket_width=1.0, num_buckets=1024)
     bkitevsim.queues.PriorityQueue(bucket_width=1.0)
     bkitevsim.core.BkSysCoEventLoop(end_time, bucket_width).run(max_iterations=None)
+        ↳ dùng bởi `CoroutineKernel`; LP coroutine nhận event qua `handle_event`, chờ qua
+          `wait_for_event`/`wait_until_time` (loop chỉ tiến thời gian khi không LP nào READY)
     bkitevsim.core.BkSysCoLogicalProcess      (coroutine)
     bkitevsim.dispatchers.SequentialEventDispatcher(end_time, bucket_width).run()
 
@@ -22,8 +24,9 @@ So với giả định cũ (`Event(source=..., destination=...)`), khác biệt 
 
 BA QUYẾT ĐỊNH CẤU HÌNH (xem `report.md` §9.4 để biết lý do)
 -----------------------------------------------------------
-1. Dùng `SequentialEventDispatcher` (1 luồng, không asyncio) ⇒ tất định, không dính
-   `asyncio.wait_for(timeout=wall_clock)` mà `BkSysCoEventLoop` dùng khi có timeout.
+1. Hai engine, **cùng một bộ LP**: `CoroutineKernel` (`BkSysCoEventLoop`, asyncio — đúng spec
+   §1.1.2, mặc định của runner) và `SequentialKernel` (`SequentialEventDispatcher`, chạy nhanh
+   ~3×, dùng để đối chứng). Cả hai cho kết quả số trùng khớp; xem `report.md` §11.5.
 2. Ghim `bucket_width = 1.0` và `num_buckets = 2048`. Lý do: `LadderQueue` chọn bucket theo
    `int(t / bucket_width) % num_buckets`, nên nếu `num_buckets * bucket_width` nhỏ hơn thời
    điểm lớn nhất thì **thứ tự event bị sai âm thầm**. Với `T_sim = 200 s` và 2048 bucket × 1 s
@@ -292,6 +295,34 @@ class LogicalProcessAdapter:
             "events_emitted": self.emitted,
         }
 
+
+class CoroutineAdapter(LogicalProcessAdapter):
+    """Bọc LP thuần thành **coroutine LP** cho `BkSysCoEventLoop` (spec §1.1.2).
+
+    LP thuần vẫn giữ nguyên `handle_event(payload, now) -> list[Emission]`: event được
+    framework giao đồng bộ, còn `coroutine_run` chỉ có nhiệm vụ giữ LP sống và nạp trước
+    event cho nguồn. Vì vậy chạy được **cùng một bộ LP** trên cả hai kernel.
+    """
+
+    def __init__(self, lp_id: int, inner: Any, registry: dict[str, int], loop: Any) -> None:
+        super().__init__(lp_id, inner, registry)
+        self._loop = loop
+        self.send_event = loop.schedule_event
+
+    async def coroutine_run(self) -> None:
+        import asyncio
+
+        self.initialize()  # nạp event đầu cho LP nguồn (stream())
+        # Chờ một mốc ngoài `end_time`: loop bỏ qua waiter quá hạn, nên LP không đẩy thời gian
+        # ảo đi và không tranh chấp với event thật. Task bị huỷ khi mô phỏng kết thúc.
+        await self._loop.wait_until_time(self.lp_id, float(self._loop.end_time) + 1.0)
+        await asyncio.sleep(0)  # pragma: no cover - chỉ để coroutine là async thật
+
+    def handle_event(self, event: Any) -> None:  # noqa: D401 - cùng chữ ký adapter đồng bộ
+        self.set_local_virt_time(event.timestamp)
+        for emission in self.inner.handle_event(event.payload, event.timestamp):
+            self.emit(emission)
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"LogicalProcessAdapter(id={self.lp_id}, name={self.name!r})"
 
@@ -376,3 +407,95 @@ class SequentialKernel:
     @property
     def current_time(self) -> float:
         return float(self.dispatcher.current_time)
+
+
+class CoroutineKernel:
+    """Chạy cùng một tập LP trên `BkSysCoEventLoop` — **asyncio**, đúng spec §1.1.2.
+
+    Khác `SequentialKernel` ở chỗ: event loop là coroutine (`asyncio.run`), mỗi LP là một
+    `coroutine_run`, và dispatcher dùng `asyncio.Future` + `asyncio.gather`/
+    `as_completed` (`CoroutineDispatcherLP`). Dùng để đối chứng cơ chế với bản đồng bộ;
+    kết quả số phải trùng khớp.
+
+    Cảnh báo: loop này dùng `asyncio.wait_for` khi `wait_for_event(..., timeout=...)` —
+    không dùng timeout wall-clock trong mô phỏng của ta (DEV.md §2).
+    """
+
+    def __init__(
+        self,
+        *,
+        end_time: float,
+        bucket_width: float = LADDER_BUCKET_WIDTH,
+    ) -> None:
+        if end_time <= 0.0:
+            raise ValueError(f"end_time phải > 0, nhận {end_time}")
+        if bucket_width <= 0.0:
+            raise ValueError(f"bucket_width phải > 0, nhận {bucket_width}")
+        bindings = _bind()
+        self.end_time = end_time
+        self.loop = bindings.BkSysCoEventLoop(end_time=end_time, bucket_width=bucket_width)
+        self._ids: dict[str, int] = {}
+        self._adapters: dict[str, Any] = {}
+
+    @property
+    def lp_ids(self) -> dict[str, int]:
+        return dict(self._ids)
+
+    def add(self, *lps: Any) -> None:
+        """Đăng ký LP; LP có `bind()` (dispatcher coroutine) nhận thêm `emit`/`loop`."""
+        for lp in lps:
+            name = getattr(lp, "name", None)
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{lp!r}: LP phải có thuộc tính `name` kiểu str")
+            if name in self._ids:
+                raise ValueError(f"LP trùng tên {name!r}")
+            lp_id = len(self._ids)
+            self._ids[name] = lp_id
+            if hasattr(lp, "bind"):
+                adapter = lp
+                adapter.bind(lp_id=lp_id, emit=self._make_emit(lp_id), loop=self.loop)
+                setter = getattr(adapter, "set_event_loop", None)
+                if setter is not None:
+                    setter(self.loop)
+            else:
+                adapter = CoroutineAdapter(lp_id, lp, self._ids, self.loop)
+            self._adapters[name] = adapter
+            self.loop.register_lp(adapter)
+
+    def _make_emit(self, sender_id: int):
+        def emit(emission: Emission) -> None:
+            receiver_id = self._ids.get(emission.destination)
+            if receiver_id is None:
+                raise KeyError(
+                    f"không có LP tên {emission.destination!r}. Đã đăng ký: {sorted(self._ids)}"
+                )
+            self.loop.schedule_event(
+                make_event(
+                    timestamp=emission.timestamp,
+                    sender_id=sender_id,
+                    receiver_id=receiver_id,
+                    event_type=event_type_for(emission.payload),
+                    payload=emission.payload,
+                )
+            )
+
+        return emit
+
+    def run(self) -> dict[str, Any]:
+        return self.loop.run()
+
+    def make_emit(self, sender_id: int):
+        """Hàm phát `Emission` từ ngoài (dùng cho test/harness nạp sự kiện ban đầu)."""
+        return self._make_emit(sender_id)
+
+    @property
+    def current_time(self) -> float:
+        return float(self.loop.current_time)
+
+    @property
+    def lp_ids(self) -> dict[str, int]:
+        return dict(self._ids)
+
+    @property
+    def adapters(self) -> dict[str, Any]:
+        return dict(self._adapters)

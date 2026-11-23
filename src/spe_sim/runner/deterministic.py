@@ -39,7 +39,7 @@ from spe_sim.core.events import (
     UvDone,
     UvTask,
 )
-from spe_sim.core.kernel import SequentialKernel
+from spe_sim.core.kernel import CoroutineKernel, SequentialKernel
 from spe_sim.lp.infra.admission import AdmissionControlLP
 from spe_sim.lp.infra.sinks import all_notices, build_sinks
 from spe_sim.lp.infra.station import StationCore
@@ -51,6 +51,7 @@ __all__ = [
     "ScenarioResult",
     "branch_delay_s",
     "run_deterministic",
+    "run_deterministic_coroutine",
 ]
 
 #: Độ trễ nhánh mặc định = service + 2 ms khứ hồi (spec §3.3: 12 / 22 / 27 ms).
@@ -191,6 +192,67 @@ class FixedService:
                 ),
             )
         ]
+
+
+def run_deterministic_coroutine(
+    runtime_model: str,
+    join_mode: JoinMode,
+    *,
+    auth_s: float | None = None,
+    catalog_s: float | None = None,
+    db_s: float | None = None,
+    db_ok: bool = True,
+    arrivals: tuple[float, ...] = (0.0,),
+    p_pin: float = 0.0,
+    p_uv: float = 0.0,
+    seed: int = 0,
+    end_time: float | None = None,
+) -> ScenarioResult:
+    """Như `run_deterministic` nhưng trên `CoroutineKernel` + `CoroutineDispatcherLP`
+    (asyncio, `asyncio.gather`/`as_completed`) — dùng để chứng minh hai cơ chế cho cùng
+    một kết quả số.
+    """
+    delays = branch_delay_s()
+    auth_delay = delays["auth"] if auth_s is None else auth_s
+    catalog_delay = delays["catalog"] if catalog_s is None else catalog_s
+    db_delay = delays["db"] if db_s is None else db_s
+
+    model = build_model(runtime_model, p_pin=p_pin, p_uv=p_uv)
+    rng = random.Random(seed) if (p_pin > 0.0 or p_uv > 0.0) else None
+    dispatcher = model.build_coroutine_dispatcher(join_mode, rng=rng)
+    admission = AdmissionControlLP(runtime_model, join_mode)  # type: ignore[arg-type]
+
+    sinks = build_sinks()
+    kernel = CoroutineKernel(
+        end_time=end_time if end_time is not None else max(arrivals, default=0.0) + 1.0
+    )
+    kernel.add(
+        admission,
+        dispatcher,
+        ExactLink(),
+        FixedService("auth_cluster", auth_delay),
+        FixedService("catalog_service", catalog_delay),
+        FixedService("db_pool", db_delay, ok=db_ok),
+        FixedUvPool(UV_POOL_SERVICE_S, channels=UV_POOL_CHANNELS),
+        *sinks.values(),
+    )
+    emit = kernel.make_emit(kernel.lp_ids["admission"])
+    for request_id, t in enumerate(arrivals):
+        emit(
+            Emission(
+                timestamp=t,
+                destination="admission",
+                payload=ReqArrival(request_id=request_id, t_arrive=t),
+            )
+        )
+    stats = kernel.run()
+    return ScenarioResult(
+        notices=all_notices(sinks.values()),
+        dispatcher=dispatcher,
+        admission=admission,
+        kernel=kernel,  # type: ignore[arg-type]
+        stats=stats,
+    )
 
 
 @dataclass

@@ -20,7 +20,7 @@ from typing import Any
 
 from spe_sim.core.config import ScenarioConfig
 from spe_sim.core.events import OutcomeNotice
-from spe_sim.core.kernel import SequentialKernel
+from spe_sim.core.kernel import CoroutineKernel, SequentialKernel
 from spe_sim.core.records import RequestRecord, records_from_notices, write_csv
 from spe_sim.core.rng import SeedStreams
 from spe_sim.lp.infra.admission import AdmissionControlLP
@@ -76,19 +76,27 @@ class RunResult:
         return write_csv(path, self.records)
 
 
-def build_system(config: ScenarioConfig) -> System:
-    """Dựng toàn bộ hệ thống cho một `ScenarioConfig` (chưa chạy)."""
+def build_system(config: ScenarioConfig, *, kernel: str = "coroutine") -> System:
+    """Dựng toàn bộ hệ thống cho một `ScenarioConfig` (chưa chạy).
+
+    `kernel="coroutine"` (mặc định) chạy trên `BkSysCoEventLoop` — asyncio, join bằng
+    `asyncio.gather`/`as_completed` — đúng spec §1.1.2. `kernel="sequential"` là bản đồng
+    bộ dùng để đối chứng cơ chế.
+    """
+    if kernel not in ("coroutine", "sequential"):
+        raise ValueError(f"kernel phải là 'coroutine' hoặc 'sequential', nhận {kernel!r}")
     streams = SeedStreams(config.seed)
     source = SourceLP(config.lam, streams.stream("source"), config.t_sim)
     admission = AdmissionControlLP(
         config.runtime_model, config.join_mode, capacity_k=config.capacity_k
     )
     model = build_model(config.runtime_model, p_pin=config.p_pin, p_uv=config.p_uv)
-    dispatcher = model.build_dispatcher(
+    rng = streams.stream("dispatcher") if (config.p_pin or config.p_uv) else None
+    builder = model.build_coroutine_dispatcher if kernel == "coroutine" else model.build_dispatcher
+    dispatcher = builder(
         config.join_mode,
-        capacity_k=config.capacity_k,
         t_timeout=config.t_timeout,
-        rng=streams.stream("dispatcher") if (config.p_pin or config.p_uv) else None,
+        rng=rng,
     )
     link = NetworkLinkLP(streams.stream("network"))
     auth = AuthClusterLP(streams.stream("lp", "auth"))
@@ -99,7 +107,8 @@ def build_system(config: ScenarioConfig) -> System:
 
     # `end_time` phải lớn hơn T_sim: dispatcher của bkitevsim bỏ event vượt end_time
     # (report.md §9.4 #2) ⇒ cộng đệm để request cuối chạy xong, thống kê vẫn cắt ở T_sim.
-    kernel = SequentialKernel(end_time=config.t_sim + 1.0)
+    kernel_cls = CoroutineKernel if kernel == "coroutine" else SequentialKernel
+    kernel = kernel_cls(end_time=config.t_sim + 1.0)
     kernel.add(
         source, admission, dispatcher, link, auth, catalog, db, uv, *sinks.values()
     )
@@ -117,9 +126,11 @@ def build_system(config: ScenarioConfig) -> System:
     )
 
 
-def run_scenario(config: ScenarioConfig, *, record: bool = True) -> RunResult:
+def run_scenario(
+    config: ScenarioConfig, *, record: bool = True, kernel: str = "coroutine"
+) -> RunResult:
     """Chạy một kịch bản tới hết `T_sim` (drain thêm tối đa 1 s ảo)."""
-    system = build_system(config)
+    system = build_system(config, kernel=kernel)
     stats = system.kernel.run()
     notices = all_notices(system.sinks.values())
 
