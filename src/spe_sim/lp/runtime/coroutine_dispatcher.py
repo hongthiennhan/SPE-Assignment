@@ -133,6 +133,10 @@ class CoroutineDispatcherLP:
         self._slot_waiters: list[asyncio.Future] = []
         self._tasks: set[asyncio.Task] = set()
 
+        # Tích phân N(t) để kiểm Little's Law (E[N] = area / span), giống bản đồng bộ.
+        self._area = 0.0
+        self._last_t = 0.0
+
         self.admitted = 0
         self.branch_requests = 0
         self.completed = 0
@@ -153,6 +157,21 @@ class CoroutineDispatcherLP:
 
     def set_local_virt_time(self, value: float) -> None:  # pragma: no cover - duck typing
         self.local_virt_time = value
+
+    def _account(self) -> None:
+        now = self._now()
+        self._area += len(self._active) * max(0.0, now - self._last_t)
+        self._last_t = now
+
+    def mean_in_system(self, span_s: float) -> float:
+        """E[N] trên cửa sổ `span_s` (dùng `N(t)` tích lũy, không phải trung bình mẫu)."""
+        if span_s <= 0.0:
+            return 0.0
+        return self._area / span_s
+
+    @property
+    def last_time(self) -> float:
+        return self._now() if self._loop is not None else self._last_t
 
     def get_statistics(self) -> dict[str, Any]:
         return {
@@ -228,6 +247,7 @@ class CoroutineDispatcherLP:
             t_arrive=admitted.t_arrive,
             t_deadline=admitted.t_arrive + self.t_timeout,
         )
+        self._account()
         self._active[req.request_id] = req
         self.admitted += 1
         self._admitted.append(admitted)
@@ -466,6 +486,7 @@ class CoroutineDispatcherLP:
         reason: str | None = None,
     ) -> None:
         req.retired = True
+        self._account()
         self._active.pop(req.request_id, None)
         self._timeouts.pop(req.request_id, None)
         if outcome is Outcome.COMPLETED:

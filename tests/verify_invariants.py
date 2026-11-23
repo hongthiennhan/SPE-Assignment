@@ -25,7 +25,7 @@ if str(_SRC) not in sys.path:
 
 from spe_sim.core.config import MS  # noqa: E402
 from spe_sim.core.events import Outcome  # noqa: E402
-from spe_sim.core.kernel import SequentialKernel  # noqa: E402
+from spe_sim.core.kernel import CoroutineKernel, SequentialKernel  # noqa: E402
 from spe_sim.core.rng import SeedStreams  # noqa: E402
 from spe_sim.lp.infra.admission import AdmissionControlLP  # noqa: E402
 from spe_sim.lp.infra.auth_cluster import AuthClusterLP  # noqa: E402
@@ -62,7 +62,10 @@ SCENARIOS: tuple[Scenario, ...] = (
 )
 
 
-def run(scenario: Scenario):
+ENGINES = ("sequential", "coroutine")
+
+
+def run(scenario: Scenario, engine: str = "sequential"):
     streams = SeedStreams(scenario.seed)
     source = SourceLP(scenario.lam, streams.stream("source"), scenario.t_sim)
     admission = AdmissionControlLP(
@@ -71,7 +74,8 @@ def run(scenario: Scenario):
     model = build_model(
         scenario.runtime_model, p_pin=scenario.p_pin, p_uv=scenario.p_uv
     )
-    dispatcher = model.build_dispatcher(
+    builder = model.build_coroutine_dispatcher if engine == "coroutine" else model.build_dispatcher
+    dispatcher = builder(
         scenario.join_mode,  # type: ignore[arg-type]
         rng=SeedStreams(scenario.seed).stream("dispatcher")
         if (scenario.p_pin or scenario.p_uv)
@@ -84,7 +88,8 @@ def run(scenario: Scenario):
     uv = UvWorkerPoolLP(streams.stream("lp", "uv"))
     sinks = build_sinks()
 
-    kernel = SequentialKernel(end_time=scenario.t_sim + 1.0)
+    kernel_cls = CoroutineKernel if engine == "coroutine" else SequentialKernel
+    kernel = kernel_cls(end_time=scenario.t_sim + 1.0)
     kernel.add(
         source, admission, dispatcher, link, auth, catalog, db, uv, *sinks.values()
     )
@@ -92,9 +97,9 @@ def run(scenario: Scenario):
     return source, admission, dispatcher, all_notices(sinks.values()), kernel
 
 
-def evaluate(scenario: Scenario) -> tuple[list[str], dict[str, float | int]]:
+def evaluate(scenario: Scenario, engine: str = "sequential") -> tuple[list[str], dict[str, float | int]]:
     problems: list[str] = []
-    source, admission, dispatcher, notices, kernel = run(scenario)
+    source, admission, dispatcher, notices, kernel = run(scenario, engine)
 
     if admission.n_in_system != 0:
         problems.append(f"ΔN: còn {admission.n_in_system} request trong hệ thống")
@@ -138,23 +143,24 @@ def evaluate(scenario: Scenario) -> tuple[list[str], dict[str, float | int]]:
 
 def main() -> int:
     print(
-        f"{'runtime':<18}{'join':<14}{'lambda':>7}{'p_pin':>7}{'p_uv':>6}"
+        f"{'engine':<12}{'runtime':<18}{'join':<14}{'lambda':>7}{'p_pin':>7}{'p_uv':>6}"
         f"{'adm':>6}{'drop':>6}{'E[r]ms':>9}{'E[N]':>8}{'status':>8}"
     )
-    print("-" * 96)
+    print("-" * 108)
     failures = 0
-    for scenario in SCENARIOS:
-        problems, row = evaluate(scenario)
-        status = "OK" if not problems else "FAIL"
-        print(
-            f"{scenario.runtime_model:<18}{scenario.join_mode:<14}{scenario.lam:>7.0f}"
-            f"{scenario.p_pin:>7.2f}{scenario.p_uv:>6.2f}{row.get('admitted', 0):>6}"
-            f"{row.get('dropped', 0):>6}{row.get('e_r_ms', 0.0):>9.2f}"
-            f"{row.get('e_n', 0.0):>8.3f}{status:>8}"
-        )
-        for problem in problems:
-            print(f"    ↳ {problem}")
-            failures += 1
+    for engine in ENGINES:
+        for scenario in SCENARIOS:
+            problems, row = evaluate(scenario, engine)
+            status = "OK" if not problems else "FAIL"
+            print(
+                f"{engine:<12}{scenario.runtime_model:<18}{scenario.join_mode:<14}{scenario.lam:>7.0f}"
+                f"{scenario.p_pin:>7.2f}{scenario.p_uv:>6.2f}{row.get('admitted', 0):>6}"
+                f"{row.get('dropped', 0):>6}{row.get('e_r_ms', 0.0):>9.2f}"
+                f"{row.get('e_n', 0.0):>8.3f}{status:>8}"
+            )
+            for problem in problems:
+                print(f"    ↳ {problem}")
+                failures += 1
 
     print()
     if failures:

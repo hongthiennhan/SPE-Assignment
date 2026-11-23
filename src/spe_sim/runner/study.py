@@ -14,11 +14,13 @@ Kiến trúc giữ nguyên: mỗi LP chỉ trả `Emission`; `core/kernel.py` l�
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from spe_sim.core.config import ScenarioConfig
+from spe_sim.core.config import N_DB_DEFAULT, ScenarioConfig
 from spe_sim.core.events import OutcomeNotice
 from spe_sim.core.kernel import CoroutineKernel, SequentialKernel
 from spe_sim.core.records import RequestRecord, records_from_notices, write_csv
@@ -34,7 +36,18 @@ from spe_sim.lp.infra.source import SourceLP
 from spe_sim.lp.infra.uv_pool import UvWorkerPoolLP
 from spe_sim.lp.runtime.models.base import build_model
 
-__all__ = ["RunResult", "System", "build_system", "run_scenario"]
+__all__ = [
+    "RunResult",
+    "System",
+    "build_system",
+    "load_scenarios",
+    "run_grid",
+    "run_scenario",
+    "scenario_configs",
+]
+
+#: `configs/scenarios.json` mặc định (study.py → runner → configs → repo root).
+DEFAULT_SCENARIOS_PATH: Path = Path(__file__).resolve().parents[3] / "configs" / "scenarios.json"
 
 
 @dataclass
@@ -124,6 +137,91 @@ def build_system(config: ScenarioConfig, *, kernel: str = "coroutine") -> System
         uv=uv,
         sinks=sinks,
     )
+
+
+def load_scenarios(path: str | Path | None = None) -> dict[str, Any]:
+    """Đọc `configs/scenarios.json` (base + 72 kịch bản chính + 42 sensitivity)."""
+    source = Path(path) if path is not None else DEFAULT_SCENARIOS_PATH
+    return json.loads(source.read_text(encoding="utf-8"))
+
+
+def scenario_configs(
+    data: dict[str, Any],
+    *,
+    seeds: Iterable[int] | None = None,
+    t_sim: float | None = None,
+) -> list[tuple[str, ScenarioConfig]]:
+    """Trải mỗi entry trong JSON thành `(id, ScenarioConfig)` cho từng seed.
+
+    Mọi entry đều đi qua `ScenarioConfig` nên các ràng buộc của spec (§3.2: `p_pin ≤ 0.20`,
+    `p_uv ≤ 0.30`, `T_warmup < T_sim`) được kiểm ngay lúc nạp, không đợi tới lúc chạy.
+    """
+    base = data["base"]
+    chosen = list(base["seeds"] if seeds is None else seeds)
+    if not chosen:
+        raise ValueError("cần ít nhất một seed")
+    duration = float(base["t_sim"] if t_sim is None else t_sim)
+    warmup = float(base["t_warmup"]) if t_sim is None else min(float(base["t_warmup"]), duration / 10)
+    out: list[tuple[str, ScenarioConfig]] = []
+    entries = list(data["scenarios"]) + list(data.get("sensitivity", []))
+    for entry in entries:
+        for seed in chosen:
+            out.append(
+                (
+                    entry["id"],
+                    ScenarioConfig(
+                        runtime_model=entry["runtime_model"],
+                        join_mode=entry["join_mode"],
+                        lam=float(entry["lam"]),
+                        seed=int(seed),
+                        n_db=int(entry.get("n_db", N_DB_DEFAULT)),
+                        p_pin=float(entry.get("p_pin", 0.0)),
+                        p_uv=float(entry.get("p_uv", 0.0)),
+                        t_sim=duration,
+                        t_warmup=warmup,
+                        capacity_k=int(base["capacity_k"]),
+                        t_timeout=float(base["t_timeout"]),
+                    ),
+                )
+            )
+    return out
+
+
+def run_grid(
+    out_dir: str | Path,
+    *,
+    data: dict[str, Any] | None = None,
+    kernel: str = "coroutine",
+    replications: int | None = None,
+    t_sim: float | None = None,
+    limit: int | None = None,
+) -> list[Path]:
+    """Chạy toàn bộ kịch bản trong `configs/scenarios.json` và ghi **một CSV / kịch bản**.
+
+    Mỗi dòng trong CSV là một request của một replication (cột `seed` phân biệt), đúng schema
+    D3 trong `core/records.py` — đây là đầu vào cho phần thống kê CI của dev khác.
+    """
+    payload = load_scenarios() if data is None else data
+    seeds = payload["base"]["seeds"]
+    if replications is not None:
+        seeds = seeds[:replications]
+    entries = scenario_configs(payload, seeds=seeds, t_sim=t_sim)
+    if limit is not None:
+        entries = entries[:limit]
+
+    target = Path(out_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, list[RequestRecord]] = {}
+    for scenario_id, config in entries:
+        result = run_scenario(config, kernel=kernel)
+        grouped.setdefault(scenario_id, []).extend(result.records)
+
+    written: list[Path] = []
+    for scenario_id, records in grouped.items():
+        # `id` chứa "|" — không hợp lệ trong tên file trên Windows, nên đổi sang "_".
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", scenario_id).strip("_")
+        written.append(write_csv(target / f"{safe}.csv", records))
+    return written
 
 
 def run_scenario(

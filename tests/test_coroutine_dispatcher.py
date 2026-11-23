@@ -89,7 +89,41 @@ class TestCoroutineSemantics(unittest.TestCase):
             self.assertEqual([round(v, 6) for v in r_ms(result)], [29.5] * 8)
 
 
+class TestUvParity(unittest.TestCase):
+    """`p_uv` (libuv Worker Pool) trên engine coroutine — trước đây chưa kiểm."""
+
+    def test_uv_offload_matches_between_engines(self) -> None:
+        for p_uv in (1.0, 0.5):
+            with self.subTest(p_uv=p_uv):
+                sync = run_deterministic("bun_event_loop", "gather", p_uv=p_uv, seed=3)
+                coro = run_deterministic_coroutine("bun_event_loop", "gather", p_uv=p_uv, seed=3)
+                self.assertEqual(r_ms(sync), r_ms(coro))
+
+    def test_uv_offload_adds_pool_delay(self) -> None:
+        # p_uv = 1 ⇒ có thêm 12 ms trên pool, nên r lớn hơn rõ rệt so với p_uv = 0.
+        without = r_ms(run_deterministic_coroutine("bun_event_loop", "gather"))[0]
+        with_uv = r_ms(run_deterministic_coroutine("bun_event_loop", "gather", p_uv=1.0))[0]
+        self.assertAlmostEqual(with_uv - without, 12.0, delta=1e-6)
+
+    def test_uv_offload_respects_pool_channels(self) -> None:
+        # 4 kênh: 5 job cùng lúc ⇒ job thứ 5 phải chờ 12 ms.
+        arrivals = tuple([0.0] * 5)
+        for runner in (run_deterministic, run_deterministic_coroutine):
+            result = runner("bun_event_loop", "gather", p_uv=1.0, arrivals=arrivals, seed=1)
+            values = sorted(r_ms(result))
+            self.assertEqual(len(values), 5)
+            self.assertGreater(values[-1] - values[0], 11.0)
+
+
 class TestCoroutineInvariants(unittest.TestCase):
+    def test_mean_in_system_is_time_integral(self) -> None:
+        # 4 request cùng lúc, mỗi cái 29.5 ms ⇒ N(t) = 4 trên [0, 29.5ms], E[N] = 4.
+        result = run_deterministic_coroutine(
+            "spring_loom_vt", "gather", arrivals=(0.0, 0.0, 0.0, 0.0)
+        )
+        span = max(result.notices[0].t_complete, 0.001)
+        self.assertAlmostEqual(result.dispatcher.mean_in_system(span), 4.0, delta=1e-9)
+
     def test_no_requests_left_behind(self) -> None:
         for runner in (run_deterministic, run_deterministic_coroutine):
             result = runner(

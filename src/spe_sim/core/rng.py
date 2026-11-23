@@ -66,19 +66,25 @@ def sample_bernoulli(rng: random.Random, p: float) -> bool:
     return rng.random() < p
 
 
-def sample_percentile(values: list[float], q: float) -> float:
+def sample_percentile(values: list[float], q: float, *, method: str = "linear") -> float:
     """Phân vị `q` (0..1) — ⚠ quy ước K10 chưa được spec chốt.
 
-    Đang dùng **linear interpolation** (giống `numpy.percentile` mặc định).
-    Nếu nhóm chốt nearest-rank, chỉ cần sửa hàm này.
+    Mặc định **linear interpolation** (giống `numpy.percentile`). Truyền
+    `method="nearest_rank"` để dùng quy ước nearest-rank (phân vị luôn là một mẫu thật).
+    Hai cách lệch nhau rất ít trên mẫu lớn — xem `tests/test_percentile.py`.
     """
     if not values:
         raise ValueError("cần mẫu khác rỗng")
     if not 0.0 <= q <= 1.0:
         raise ValueError(f"q phải trong [0, 1], nhận {q}")
+    if method not in ("linear", "nearest_rank"):
+        raise ValueError(f"method phải là 'linear' hoặc 'nearest_rank', nhận {method!r}")
     ordered = sorted(values)
     if len(ordered) == 1:
         return ordered[0]
+    if method == "nearest_rank":
+        rank = max(1, math.ceil(q * len(ordered)))
+        return ordered[rank - 1]
     pos = q * (len(ordered) - 1)
     lo = math.floor(pos)
     hi = math.ceil(pos)
