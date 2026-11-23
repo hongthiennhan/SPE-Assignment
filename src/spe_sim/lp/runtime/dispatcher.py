@@ -27,6 +27,7 @@ BỐN QUYẾT ĐỊNH CẦN BIẾT
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -49,6 +50,8 @@ from spe_sim.core.events import (
     SubReq,
     SubResp,
     TimeoutAlarm,
+    UvDone,
+    UvTask,
 )
 from spe_sim.lp.infra.sinks import SINK_COMPLETED, SINK_DROPPED, SINK_TIMEOUT
 
@@ -80,6 +83,8 @@ class _Active:
     forced_reason: str | None = None
     holding_slot: bool = False
     pending_phase: str | None = None
+    pinned: bool = False
+    uv_offloaded: bool = False
 
     @property
     def branches_left(self) -> int:
@@ -99,10 +104,19 @@ class RuntimeDispatcherLP:
         capacity_k: int = ADMISSION_CAPACITY_K,
         t_timeout: float = T_TIMEOUT_S,
         sub_request_target: str = LP_NETWORK_LINK,
+        pin_probability: float = 0.0,
+        uv_probability: float = 0.0,
+        rng: random.Random | None = None,
+        uv_pool_name: str = "uv_pool",
         name: str = "dispatcher",
     ) -> None:
         if join_mode not in ("gather", "as_completed"):
             raise ValueError(f"join_mode không hợp lệ: {join_mode!r}")
+        for label, value in (("pin_probability", pin_probability), ("uv_probability", uv_probability)):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{label} phải trong [0, 1], nhận {value}")
+            if value > 0.0 and rng is None:
+                raise ValueError(f"{label} > 0 cần `rng` để tái lập (DEV.md §3)")
         if capacity_k < 1:
             raise ValueError(f"K phải ≥ 1, nhận {capacity_k}")
         if t_timeout <= 0.0:
@@ -116,6 +130,10 @@ class RuntimeDispatcherLP:
         self.capacity_k = capacity_k
         self.t_timeout = t_timeout
         self.sub_request_target = sub_request_target
+        self.pin_probability = pin_probability
+        self.uv_probability = uv_probability
+        self.uv_pool_name = uv_pool_name
+        self._rng = rng
 
         self.channels = profile.channels
         self.ingress_s = profile.ingress_s
@@ -135,6 +153,12 @@ class RuntimeDispatcherLP:
         self.completed = 0
         self.timed_out = 0
         self.db_dropped = 0
+        self.pinned_requests = 0
+        self.uv_requests = 0
+
+        # Tích phân N(t) theo thời gian để kiểm Little's Law (spec §1.5.2).
+        self._area_in_system = 0.0
+        self._last_t = 0.0
 
     # ------------------------------------------------------------------ trạng thái
     @property
@@ -149,8 +173,28 @@ class RuntimeDispatcherLP:
     def queued(self) -> int:
         return sum(1 for rid, _ in self._waiting if rid in self._active)
 
+    def _observe(self, now: float) -> None:
+        """Cộng diện tích `N(t)` giữa hai mốc — dùng cho `mean_in_system`."""
+        if now < self._last_t:
+            raise ValueError(f"{self.name}: thời gian lùi ({now} < {self._last_t})")
+        self._area_in_system += len(self._active) * (now - self._last_t)
+        self._last_t = now
+
+    @property
+    def last_time(self) -> float:
+        """Mốc thời gian của event gần nhất đã xử lý (đuôi drain sau `T_sim`)."""
+        return self._last_t
+
+    def mean_in_system(self, t_end: float) -> float:
+        """`E[N]` trung bình theo thời gian trên `[0, t_end]`."""
+        if t_end <= 0.0:
+            raise ValueError(f"t_end phải > 0, nhận {t_end}")
+        self._observe(t_end)
+        return self._area_in_system / t_end
+
     # ------------------------------------------------------------------ sự kiện
     def handle_event(self, payload: object, now: float) -> list[Emission]:
+        self._observe(now)
         if isinstance(payload, Admitted):
             return self._on_admitted(payload, now)
         if isinstance(payload, SubResp):
@@ -159,6 +203,8 @@ class RuntimeDispatcherLP:
             return self._on_alarm(payload, now)
         if isinstance(payload, CpuTimer):
             return self._on_cpu_timer(payload, now)
+        if isinstance(payload, UvDone):
+            return self._on_uv_done(payload, now)
         raise TypeError(f"{self.name}: không nhận payload {type(payload).__name__}")
 
     # ------------------------------------------------------------------ nhận request
@@ -186,8 +232,28 @@ class RuntimeDispatcherLP:
                 payload=TimeoutAlarm(req.request_id, req.t_deadline),
             )
         ]
+        if self.uv_probability > 0.0 and self._rng is not None and self._rng.random() < self.uv_probability:
+            # Offload pha ingress sang libuv: loop **không** bị giữ trong 12 ms.
+            req.uv_offloaded = True
+            self.uv_requests += 1
+            return out + [
+                Emission(
+                    timestamp=now,
+                    destination=self.uv_pool_name,
+                    payload=UvTask(request_id=req.request_id, t_submit=now),
+                )
+            ]
+
         out.extend(self._enqueue(req, PHASE_INGRESS, now))
         return out
+
+    def _on_uv_done(self, done: UvDone, now: float) -> list[Emission]:
+        """Job offload xong → xin kênh loop để chạy fan-out như bình thường."""
+        req = self._active.get(done.request_id)
+        if req is None or req.retired:
+            self.late_responses += 1
+            return []
+        return self._enqueue(req, PHASE_INGRESS, now)
 
     # ------------------------------------------------------------------ slot pool
     def _enqueue(self, req: _Active, phase: str, now: float) -> list[Emission]:
@@ -244,8 +310,12 @@ class RuntimeDispatcherLP:
             return []
 
         if timer.kind == PHASE_INGRESS:
+            # Pinning: quyết định theo từng request (K12). Blocking thì luôn giữ.
+            req.pinned = self.holds_slot_during_io or self._sample_pin()
+            if req.pinned:
+                self.pinned_requests += 1
             out: list[Emission] = []
-            if not self.holds_slot_during_io:
+            if not req.pinned:
                 out.extend(self._release(req, now))
             out.extend(self._fan_out(req, now))
             return out
@@ -325,9 +395,8 @@ class RuntimeDispatcherLP:
         req.joined = True
         if forced_reason is not None:
             req.forced_reason = forced_reason
-        if self.holds_slot_during_io:
+        if req.holding_slot:
             # Blocking / pinning: kênh vẫn đang giữ ⇒ chạy callback ngay.
-            req.holding_slot = True
             return [
                 Emission(
                     timestamp=now + self.callback_s,
@@ -439,6 +508,12 @@ class RuntimeDispatcherLP:
             reason=reason,
         )
 
+    def _sample_pin(self) -> bool:
+        """Bernoulli `p_pin` cho Thread Pinning (Loom). Không có rng ⇒ không bao giờ pin."""
+        if self.pin_probability <= 0.0 or self._rng is None:
+            return False
+        return self._rng.random() < self.pin_probability
+
     # ------------------------------------------------------------------ thống kê
     def snapshot(self) -> dict[str, float | int]:
         return {
@@ -452,6 +527,8 @@ class RuntimeDispatcherLP:
             "timed_out": self.timed_out,
             "db_dropped": self.db_dropped,
             "late_responses": self.late_responses,
+            "pinned_requests": self.pinned_requests,
+            "uv_requests": self.uv_requests,
             "in_system_at_end": self.n_in_system,
             "busy_channels": self._busy,
             "queued": self.queued,

@@ -153,6 +153,27 @@ class OutcomeNotice:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class UvTask:
+    """Dispatcher → libuv Worker Pool: tác vụ đồng bộ bị offload (spec §1.1.1, `p_uv`).
+
+    GIẢ ĐỊNH (project.md §9.6): offload thay cho pha ingress CPU trên event loop, nên
+    trong 12 ms đó loop **không** bị giữ ⇒ đây chính là lợi ích của worker pool.
+    """
+
+    request_id: int
+    t_submit: float
+
+
+@dataclass(slots=True)
+class UvDone:
+    """libuv Worker Pool → Dispatcher (hoặc timer nội bộ của pool)."""
+
+    request_id: int
+    t_submit: float
+    t_start: float = 0.0
+
+
 Payload = (
     ReqArrival
     | Admitted
@@ -161,6 +182,8 @@ Payload = (
     | JobDone
     | TimeoutAlarm
     | CpuTimer
+    | UvTask
+    | UvDone
     | OutcomeNotice
 )
 

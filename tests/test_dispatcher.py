@@ -34,74 +34,9 @@ from spe_sim.lp.runtime.dispatcher import RuntimeDispatcherLP
 MS = 1e-3
 
 
-class _ExactLink:
-    """Network link không trễ: chỉ định tuyến `SUB_REQ` sang đúng service."""
-
-    name = "network_link"
-
-    def handle_event(self, payload: object, now: float) -> list[Emission]:
-        if isinstance(payload, SubReq):
-            return [
-                Emission(
-                    timestamp=now,
-                    destination=SERVICE_LP_NAMES[payload.branch.value],
-                    payload=payload,
-                )
-            ]
-        if isinstance(payload, SubResp):
-            return [Emission(timestamp=now, destination=LP_DISPATCHER, payload=payload)]
-        raise TypeError(type(payload).__name__)
-
-
-class _FixedService:
-    """Service trả lời sau đúng `delay_s` (hoặc từ chối ngay nếu `ok=False`)."""
-
-    def __init__(
-        self,
-        name: str,
-        delay_s: float,
-        *,
-        ok: bool = True,
-        reason: str | None = "no_connection",
-    ) -> None:
-        self.name = name
-        self.delay_s = delay_s
-        self.ok = ok
-        self.reason = reason
-
-    def handle_event(self, payload: object, now: float) -> list[Emission]:
-        if not isinstance(payload, SubReq):
-            raise TypeError(f"{self.name}: không nhận {type(payload).__name__}")
-        if not self.ok:
-            return [
-                Emission(
-                    timestamp=now,
-                    destination=LP_DISPATCHER,
-                    payload=SubResp(
-                        payload.request_id,
-                        payload.branch,
-                        t_sent=payload.t_sent,
-                        t_service_start=now,
-                        t_service_end=now,
-                        ok=False,
-                        reason=self.reason,
-                    ),
-                )
-            ]
-        end = now + self.delay_s
-        return [
-            Emission(
-                timestamp=end,
-                destination=LP_DISPATCHER,
-                payload=SubResp(
-                    payload.request_id,
-                    payload.branch,
-                    t_sent=payload.t_sent,
-                    t_service_start=now,
-                    t_service_end=end,
-                ),
-            )
-        ]
+# Service/đường mạng tất định dùng chung với `runner/deterministic.py`.
+from spe_sim.runner.deterministic import ExactLink as _ExactLink
+from spe_sim.runner.deterministic import FixedService as _FixedService
 
 
 def _run(
