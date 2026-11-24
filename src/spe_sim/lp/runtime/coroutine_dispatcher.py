@@ -50,7 +50,7 @@ from spe_sim.core.events import (
     UvTask,
 )
 from spe_sim.lp.infra.sinks import SINK_COMPLETED, SINK_TIMEOUT
-from spe_sim.lp.runtime.dispatcher import PHASE_CALLBACK, PHASE_INGRESS
+from spe_sim.lp.runtime.dispatcher import PHASE_CALLBACK, PHASE_INGRESS, sample_cpu_phases
 
 __all__ = ["CoroutineDispatcherLP"]
 
@@ -77,6 +77,8 @@ class _Req:
     holding_slot: bool = False
     retired: bool = False
     uv_future: asyncio.Future | None = None
+    ingress_s: float = 0.0
+    callback_s: float = 0.0
 
 
 class CoroutineDispatcherLP:
@@ -92,6 +94,7 @@ class CoroutineDispatcherLP:
         pin_probability: float = 0.0,
         uv_probability: float = 0.0,
         rng: random.Random | None = None,
+        cpu_rng: random.Random | None = None,
         uv_pool_name: str = "uv_pool",
         name: str = "dispatcher",
     ) -> None:
@@ -112,6 +115,7 @@ class CoroutineDispatcherLP:
         self.uv_probability = uv_probability
         self.uv_pool_name = uv_pool_name
         self._rng = rng
+        self._cpu_rng = cpu_rng  # None ⇒ CPU tất định; có ⇒ CPU ~ Exp (A4)
 
         self.channels = profile.channels
         self.ingress_s = profile.ingress_s
@@ -247,6 +251,10 @@ class CoroutineDispatcherLP:
             t_arrive=admitted.t_arrive,
             t_deadline=admitted.t_arrive + self.t_timeout,
         )
+        # Rút số CPU ngay lúc admit — cùng thời điểm với bản đồng bộ ⇒ hai engine trùng số.
+        req.ingress_s, req.callback_s = sample_cpu_phases(
+            self.ingress_s, self.callback_s, self._cpu_rng
+        )
         self._account()
         self._active[req.request_id] = req
         self.admitted += 1
@@ -354,7 +362,7 @@ class CoroutineDispatcherLP:
 
         await self._acquire(req)
         req.t_dispatch = self._now()
-        await self._delay(req, PHASE_INGRESS, self.ingress_s)
+        await self._delay(req, PHASE_INGRESS, req.ingress_s)
 
         req.pinned = self.holds_slot_during_io or self._sample_pin()
         if req.pinned:
@@ -366,7 +374,7 @@ class CoroutineDispatcherLP:
 
         if not req.holding_slot:
             await self._acquire(req)
-        await self._delay(req, PHASE_CALLBACK, self.callback_s)
+        await self._delay(req, PHASE_CALLBACK, req.callback_s)
         self._release(req)
         # Chốt kết cục ngay trong coroutine của request: tránh phụ thuộc số vòng bơm của
         # `BkSysCoEventLoop` sau khi event cuối cùng được xử lý xong.

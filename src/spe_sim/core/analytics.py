@@ -100,32 +100,33 @@ def branch_order_stats() -> dict[str, float]:
 # Erlang-B / Erlang-C (spec §1.4 Bảng 1) — dùng cho Validation và cho DB pool
 # --------------------------------------------------------------------------------------
 def erlang_b(channels: int, offered_load: float) -> float:
-    """Erlang-B: xác suất từ chối của M/M/n/n với a = λ/µ."""
+    """Erlang-B: xác suất từ chối của M/M/n/n với a = λ/µ.
+
+    Dùng công thức truy hồi `B(k) = a·B(k−1) / (k + a·B(k−1))` (gộp từ harness hàng đợi
+    đơn): cùng giá trị với dạng `(aⁿ/n!) / Σ aⁱ/i!` của spec nhưng không tràn số khi n lớn.
+    """
     if channels < 1:
         raise ValueError("channels phải ≥ 1")
     if offered_load < 0.0:
         raise ValueError("offered_load phải ≥ 0")
-    inverse = 1.0
-    term = 1.0
-    for i in range(1, channels + 1):
-        term *= offered_load / i
-        inverse += term
-    term = 1.0
-    for i in range(1, channels + 1):
-        term *= offered_load / i
-    return term / inverse
+    b = 1.0
+    for k in range(1, channels + 1):
+        b = offered_load * b / (k + offered_load * b)
+    return b
 
 
 def erlang_c(channels: int, offered_load: float) -> float:
-    """Erlang-C: xác suất một job phải xếp hàng của M/M/c (ρ = a/c < 1)."""
+    """Erlang-C: xác suất một job phải xếp hàng của M/M/c (ρ = a/c < 1).
+
+    `C(c, a) = B / (1 − ρ(1 − B))` với `B = erlang_b(c, a)` — tương đương dạng giai thừa.
+    """
     if channels < 1:
         raise ValueError("channels phải ≥ 1")
     rho = offered_load / channels
     if rho >= 1.0:
         raise ValueError(f"cần ρ = a/c < 1 để có nghiệm ổn định, nhận ρ = {rho}")
-    numerator = offered_load**channels / math.factorial(channels) * (channels / (channels - offered_load))
-    partial = sum(offered_load**i / math.factorial(i) for i in range(channels))
-    return numerator / (partial + numerator)
+    b = erlang_b(channels, offered_load)
+    return b / (1.0 - rho * (1.0 - b))
 
 
 def mean_wait_mmc(channels: int, service_mean_s: float, lam: float) -> float:
@@ -162,6 +163,139 @@ def mean_system_mm1k(lam: float, mu: float, capacity: int) -> dict[str, float]:
         "mean_r_s": mean_r,
         "rho": rho,
     }
+
+
+# --------------------------------------------------------------------------------------
+# 6 hàng đợi đơn (spec §1.4 Bảng 1) — gộp từ harness `validation_single_queues.py`
+# --------------------------------------------------------------------------------------
+# Mọi hàm trả cùng một dạng, đơn vị SI:
+#     L, Lq        : số khách trung bình trong hệ thống / trong hàng đợi
+#     W, Wq        : thời gian trung bình trong hệ thống / chờ (giây)
+#     X            : thông lượng hiệu dụng λ_eff (req/s)
+#     P_block      : xác suất bị từ chối khi đến
+#     U            : hệ số sử dụng mỗi kênh (None với M/M/∞)
+QueueMetrics = dict[str, float | None]
+
+
+def _check_rates(lam: float, mu: float) -> None:
+    if lam <= 0.0 or mu <= 0.0:
+        raise ValueError(f"cần λ > 0 và µ > 0, nhận λ={lam}, µ={mu}")
+
+
+def mm1(lam: float, mu: float) -> QueueMetrics:
+    """M/M/1: ρ = λ/µ < 1, L = ρ/(1−ρ), W = 1/(µ−λ)."""
+    _check_rates(lam, mu)
+    rho = lam / mu
+    if rho >= 1.0:
+        raise ValueError(f"M/M/1 không ổn định (ρ = {rho} ≥ 1)")
+    big_l = rho / (1.0 - rho)
+    return {
+        "L": big_l,
+        "Lq": rho * big_l,
+        "W": 1.0 / (mu - lam),
+        "Wq": rho / (mu - lam),
+        "X": lam,
+        "P_block": 0.0,
+        "U": rho,
+    }
+
+
+def mmck(lam: float, mu: float, c: int, capacity: int) -> QueueMetrics:
+    """M/M/c/K: giải chính xác CTMC sinh–tử hữu hạn p_0..p_K (spec §1.4)."""
+    _check_rates(lam, mu)
+    if c < 1 or capacity < c:
+        raise ValueError(f"cần 1 ≤ c ≤ K, nhận c={c}, K={capacity}")
+    weights = [1.0]
+    for n in range(1, capacity + 1):
+        weights.append(weights[-1] * lam / (min(n, c) * mu))
+    total = sum(weights)
+    p = [w / total for w in weights]
+    big_l = sum(n * pn for n, pn in enumerate(p))
+    lq = sum((n - c) * pn for n, pn in enumerate(p) if n > c)
+    p_k = p[capacity]
+    lam_eff = lam * (1.0 - p_k)
+    busy = sum(min(n, c) * pn for n, pn in enumerate(p))
+    return {
+        "L": big_l,
+        "Lq": lq,
+        "W": big_l / lam_eff,
+        "Wq": lq / lam_eff,
+        "X": lam_eff,
+        "P_block": p_k,
+        "U": busy / c,
+    }
+
+
+def mm1k(lam: float, mu: float, capacity: int) -> QueueMetrics:
+    """M/M/1/K: P_K = (1−ρ)ρᴷ / (1−ρᴷ⁺¹); dùng chung lõi với `mean_system_mm1k`."""
+    _check_rates(lam, mu)
+    base = mean_system_mm1k(lam, mu, capacity)
+    rho = lam / mu
+    p0 = (1.0 / (capacity + 1)) if abs(rho - 1.0) < 1e-12 else (1.0 - rho) / (1.0 - rho ** (capacity + 1))
+    util = 1.0 - p0
+    return {
+        "L": base["mean_n"],
+        "Lq": base["mean_n"] - util,
+        "W": base["mean_r_s"],
+        "Wq": base["mean_r_s"] - 1.0 / mu,
+        "X": base["lambda_eff"],
+        "P_block": base["p_drop"],
+        "U": util,
+    }
+
+
+def mminf(lam: float, mu: float) -> QueueMetrics:
+    """M/M/∞: Wq = 0, W = 1/µ, L = λ/µ."""
+    _check_rates(lam, mu)
+    return {"L": lam / mu, "Lq": 0.0, "W": 1.0 / mu, "Wq": 0.0, "X": lam, "P_block": 0.0, "U": None}
+
+
+def mmnn(lam: float, mu: float, n: int) -> QueueMetrics:
+    """M/M/n/n (Erlang loss): P_block = B(n, a), L = λ_eff/µ."""
+    _check_rates(lam, mu)
+    blocked = erlang_b(n, lam / mu)
+    lam_eff = lam * (1.0 - blocked)
+    big_l = lam_eff / mu
+    return {
+        "L": big_l,
+        "Lq": 0.0,
+        "W": 1.0 / mu,
+        "Wq": 0.0,
+        "X": lam_eff,
+        "P_block": blocked,
+        "U": big_l / n,
+    }
+
+
+def mmc(lam: float, mu: float, c: int) -> QueueMetrics:
+    """M/M/c (Erlang-C): Wq = C(c,a)/(cµ−λ), W = 1/µ + Wq."""
+    _check_rates(lam, mu)
+    offered = lam / mu
+    rho = offered / c
+    if rho >= 1.0:
+        raise ValueError(f"M/M/c không ổn định (ρ = {rho} ≥ 1)")
+    wq = erlang_c(c, offered) / (c * mu - lam)
+    lq = lam * wq
+    return {
+        "L": lq + offered,
+        "Lq": lq,
+        "W": wq + 1.0 / mu,
+        "Wq": wq,
+        "X": lam,
+        "P_block": 0.0,
+        "U": rho,
+    }
+
+
+#: Tra công thức theo ký hiệu Kendall — dùng bởi `spe_sim.validation`.
+ANALYTIC_MODELS: dict[str, object] = {
+    "M/M/1": mm1,
+    "M/M/1/K": mm1k,
+    "M/M/inf": mminf,
+    "M/M/n/n": mmnn,
+    "M/M/c": mmc,
+    "M/M/c/K": mmck,
+}
 
 
 def theoretical_capacities() -> dict[str, float]:

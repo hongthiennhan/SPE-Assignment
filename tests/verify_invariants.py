@@ -50,6 +50,8 @@ class Scenario:
     p_pin: float = 0.0
     p_uv: float = 0.0
     n_db: int = 24
+    cpu_scale: float = 1.0
+    cpu_dist: str = "exp"  # A4: Stochastic Workload — CPU ~ Exp (spec §1.5.1)
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -59,6 +61,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("spring_loom_vt", "gather", 250.0),
     Scenario("spring_loom_vt", "as_completed", 250.0, p_pin=0.20),
     Scenario("nodejs_event_loop", "gather", 150.0, p_uv=0.30, seed=11),
+    Scenario("bun_event_loop", "gather", 300.0, p_uv=0.15, cpu_scale=2.0, seed=13),  # B2
+    Scenario("nodejs_event_loop", "gather", 150.0, cpu_dist="det"),  # CPU tất định
 )
 
 
@@ -72,7 +76,10 @@ def run(scenario: Scenario, engine: str = "sequential"):
         scenario.runtime_model, scenario.join_mode  # type: ignore[arg-type]
     )
     model = build_model(
-        scenario.runtime_model, p_pin=scenario.p_pin, p_uv=scenario.p_uv
+        scenario.runtime_model,
+        p_pin=scenario.p_pin,
+        p_uv=scenario.p_uv,
+        cpu_scale=scenario.cpu_scale,
     )
     builder = model.build_coroutine_dispatcher if engine == "coroutine" else model.build_dispatcher
     dispatcher = builder(
@@ -80,6 +87,7 @@ def run(scenario: Scenario, engine: str = "sequential"):
         rng=SeedStreams(scenario.seed).stream("dispatcher")
         if (scenario.p_pin or scenario.p_uv)
         else None,
+        cpu_rng=streams.stream("cpu") if scenario.cpu_dist == "exp" else None,
     )
     link = NetworkLinkLP(streams.stream("network"))
     auth = AuthClusterLP(streams.stream("lp", "auth"))
@@ -107,10 +115,17 @@ def evaluate(scenario: Scenario, engine: str = "sequential") -> tuple[list[str],
         problems.append(
             f"ΔN: {admission.admitted}+{admission.dropped} != {source.emitted} arrived"
         )
-    if len(notices) != admission.admitted:
-        problems.append(f"notice {len(notices)} != admitted {admission.admitted}")
+    # `all_notices` gồm cả notice 503 (DROPPED) của Admission ⇒ so với arrived; còn các
+    # request đã admit thì so riêng phần kết cục do dispatcher chốt.
+    if len(notices) != admission.admitted + admission.dropped:
+        problems.append(
+            f"notice {len(notices)} != admitted {admission.admitted} + dropped {admission.dropped}"
+        )
     if len({n.request_id for n in notices}) != len(notices):
         problems.append("có request_id trùng trong kết cục")
+    notices = [n for n in notices if n.outcome is not Outcome.DROPPED]
+    if len(notices) != admission.admitted:
+        problems.append(f"kết cục của dispatcher {len(notices)} != admitted {admission.admitted}")
     ratio = dispatcher.branch_requests / max(admission.admitted, 1)
     if abs(ratio - 3.0) > 1e-9:
         problems.append(f"branch ratio {ratio:.6f} != 3.0")
@@ -143,23 +158,55 @@ def evaluate(scenario: Scenario, engine: str = "sequential") -> tuple[list[str],
 
 def main() -> int:
     print(
-        f"{'engine':<12}{'runtime':<18}{'join':<14}{'lambda':>7}{'p_pin':>7}{'p_uv':>6}"
+        f"{'engine':<12}{'runtime':<22}{'join':<14}{'lambda':>7}{'p_pin':>7}{'p_uv':>6}"
         f"{'adm':>6}{'drop':>6}{'E[r]ms':>9}{'E[N]':>8}{'status':>8}"
     )
-    print("-" * 108)
+    print("-" * 112)
     failures = 0
+    rows: dict[tuple[str, Scenario], dict[str, float | int]] = {}
     for engine in ENGINES:
         for scenario in SCENARIOS:
             problems, row = evaluate(scenario, engine)
+            rows[(engine, scenario)] = row
             status = "OK" if not problems else "FAIL"
+            label = scenario.runtime_model
+            if scenario.cpu_scale != 1.0:
+                label += f" x{scenario.cpu_scale:g}"
+            if scenario.cpu_dist != "exp":
+                label += " det"
             print(
-                f"{engine:<12}{scenario.runtime_model:<18}{scenario.join_mode:<14}{scenario.lam:>7.0f}"
+                f"{engine:<12}{label:<22}{scenario.join_mode:<14}{scenario.lam:>7.0f}"
                 f"{scenario.p_pin:>7.2f}{scenario.p_uv:>6.2f}{row.get('admitted', 0):>6}"
                 f"{row.get('dropped', 0):>6}{row.get('e_r_ms', 0.0):>9.2f}"
                 f"{row.get('e_n', 0.0):>8.3f}{status:>8}"
             )
             for problem in problems:
                 print(f"    ↳ {problem}")
+                failures += 1
+
+    # Hai engine phải cho cùng con số với cùng seed (đối chứng cơ chế, kể cả CPU ~ Exp).
+    # Ngoại lệ đã biết (có từ trước A4, kiểm lại trên nhánh main gốc): khi Admission phải
+    # drop (quá tải), hai engine xếp thứ tự các event **cùng timestamp** (nhả slot vs. request
+    # mới đến) khác nhau ⇒ lệch nhẹ. Khi đó chỉ kiểm lệch admitted ≤ 5 %.
+    for scenario in SCENARIOS:
+        seq, cor = rows[("sequential", scenario)], rows[("coroutine", scenario)]
+        overloaded = int(seq.get("dropped", 0)) > 0 or int(cor.get("dropped", 0)) > 0
+        if overloaded:
+            a, b = float(seq.get("admitted", 0)), float(cor.get("admitted", 0))
+            gap = abs(a - b) / max(a, b, 1.0)
+            note = "OK" if gap <= 0.05 else "FAIL"
+            print(
+                f"    ↳ [quá tải] {scenario.runtime_model}/λ={scenario.lam:g}: admitted "
+                f"{a:.0f} vs {b:.0f} (lệch {100 * gap:.2f} %, cho phép ≤ 5 %) {note}"
+            )
+            failures += note == "FAIL"
+            continue
+        for key in ("admitted", "dropped", "e_r_ms"):
+            if abs(float(seq.get(key, 0)) - float(cor.get(key, 0))) > 1e-9:
+                print(
+                    f"    ↳ hai engine lệch ở {scenario.runtime_model}/{scenario.join_mode}"
+                    f"/λ={scenario.lam:g}: {key} {seq.get(key)} != {cor.get(key)}"
+                )
                 failures += 1
 
     print()

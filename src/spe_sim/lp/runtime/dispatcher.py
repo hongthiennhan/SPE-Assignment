@@ -66,6 +66,26 @@ PHASE_CALLBACK: Final[str] = "callback"
 REASON_DB_FULL: Final[str] = "db_full"
 
 
+def sample_cpu_phases(
+    ingress_s: float, callback_s: float, cpu_rng: random.Random | None
+) -> tuple[float, float]:
+    """Thời gian hai pha CPU của **một** request (spec §1.5.1, §3.1).
+
+    - `cpu_rng is None` (Deterministic Workload): trả nguyên `(ingress_s, callback_s)`.
+    - Ngược lại: sample tổng `S ~ Exp(mean = ingress_s + callback_s)` **một lần** rồi chia
+      đúng tỉ lệ của profile (60/40 với Node.js/Bun, 1.5/1.0 với Loom, 100/0 với Blocking).
+      Nhờ đó kỳ vọng mỗi pha giữ nguyên và tổng CPU một request là biến mũ, khớp giả định
+      M/M/1/K và M/M/c/K của Bảng 1.
+
+    Dùng chung cho `RuntimeDispatcherLP` và `CoroutineDispatcherLP` để hai engine rút số
+    giống hệt nhau (cùng thời điểm: lúc admit request).
+    """
+    if cpu_rng is None:
+        return ingress_s, callback_s
+    factor = cpu_rng.expovariate(1.0)  # Exp(1) × mean = Exp(mean)
+    return ingress_s * factor, callback_s * factor
+
+
 @dataclass(slots=True)
 class _Active:
     """Trạng thái một request đang trong tầng điều phối."""
@@ -85,6 +105,8 @@ class _Active:
     pending_phase: str | None = None
     pinned: bool = False
     uv_offloaded: bool = False
+    ingress_s: float = 0.0
+    callback_s: float = 0.0
 
     @property
     def branches_left(self) -> int:
@@ -107,6 +129,7 @@ class RuntimeDispatcherLP:
         pin_probability: float = 0.0,
         uv_probability: float = 0.0,
         rng: random.Random | None = None,
+        cpu_rng: random.Random | None = None,
         uv_pool_name: str = "uv_pool",
         name: str = "dispatcher",
     ) -> None:
@@ -117,6 +140,9 @@ class RuntimeDispatcherLP:
                 raise ValueError(f"{label} phải trong [0, 1], nhận {value}")
             if value > 0.0 and rng is None:
                 raise ValueError(f"{label} > 0 cần `rng` để tái lập (DEV.md §3)")
+        # cpu_rng: None ⇒ CPU tất định; có ⇒ CPU ~ Exp (A4). Tách khỏi `rng` để thêm/bớt
+        # pinning, offload không làm xê dịch dãy số CPU (và ngược lại).
+        self._cpu_rng = cpu_rng
         if capacity_k < 1:
             raise ValueError(f"K phải ≥ 1, nhận {capacity_k}")
         if t_timeout <= 0.0:
@@ -222,6 +248,9 @@ class RuntimeDispatcherLP:
             t_arrive=admitted.t_arrive,
             t_deadline=admitted.t_arrive + self.t_timeout,
         )
+        req.ingress_s, req.callback_s = sample_cpu_phases(
+            self.ingress_s, self.callback_s, self._cpu_rng
+        )
         self._active[req.request_id] = req
         self.admitted += 1
 
@@ -270,12 +299,12 @@ class RuntimeDispatcherLP:
         if phase == PHASE_INGRESS:
             req.t_dispatch = now
             return Emission(
-                timestamp=now + self.ingress_s,
+                timestamp=now + req.ingress_s,
                 destination=self.name,
                 payload=CpuTimer(req.request_id, PHASE_INGRESS),
             )
         return Emission(
-            timestamp=now + self.callback_s,
+            timestamp=now + req.callback_s,
             destination=self.name,
             payload=CpuTimer(req.request_id, PHASE_CALLBACK),
         )
@@ -399,7 +428,7 @@ class RuntimeDispatcherLP:
             # Blocking / pinning: kênh vẫn đang giữ ⇒ chạy callback ngay.
             return [
                 Emission(
-                    timestamp=now + self.callback_s,
+                    timestamp=now + req.callback_s,
                     destination=self.name,
                     payload=CpuTimer(req.request_id, PHASE_CALLBACK),
                 )

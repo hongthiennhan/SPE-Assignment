@@ -34,7 +34,7 @@ class RuntimeModel:
     supports_pin: Final[bool] = False
     supports_uv: Final[bool] = False
 
-    def __init__(self, *, p_pin: float = 0.0, p_uv: float = 0.0) -> None:
+    def __init__(self, *, p_pin: float = 0.0, p_uv: float = 0.0, cpu_scale: float = 1.0) -> None:
         if not 0.0 <= p_pin <= 1.0:
             raise ValueError(f"p_pin phải trong [0, 1], nhận {p_pin}")
         if not 0.0 <= p_uv <= 1.0:
@@ -49,11 +49,15 @@ class RuntimeModel:
             )
         self.p_pin = p_pin
         self.p_uv = p_uv
+        self.cpu_scale = cpu_scale
+        self.profile  # noqa: B018 - kiểm cpu_scale hợp lệ với model ngay lúc dựng
 
     # ------------------------------------------------------------------ cấu hình
     @property
     def profile(self) -> RuntimeProfile:
-        return get_profile(self.model_name, p_pin=self.p_pin, p_uv=self.p_uv)
+        return get_profile(
+            self.model_name, p_pin=self.p_pin, p_uv=self.p_uv, cpu_scale=self.cpu_scale
+        )
 
     @property
     def label(self) -> str:
@@ -117,6 +121,7 @@ class RuntimeModel:
             "holds_slot_during_io": profile.holds_slot_during_io,
             "p_pin": self.p_pin,
             "p_uv": self.p_uv,
+            "cpu_scale": self.cpu_scale,
             "theoretical_capacity_rps": profile.theoretical_capacity_rps,
         }
 
@@ -128,13 +133,15 @@ def model_names() -> tuple[str, ...]:
     return RUNTIME_MODELS
 
 
-def build_model(name: str, *, p_pin: float = 0.0, p_uv: float = 0.0) -> RuntimeModel:
+def build_model(
+    name: str, *, p_pin: float = 0.0, p_uv: float = 0.0, cpu_scale: float = 1.0
+) -> RuntimeModel:
     """Tra model theo tên chuỗi cố định của `DEV.md` §4."""
     try:
         cls = MODEL_REGISTRY[name]
     except KeyError as exc:
         raise ValueError(f"runtime_model không hợp lệ: {name!r}; phải là {RUNTIME_MODELS}") from exc
-    return cls(p_pin=p_pin, p_uv=p_uv)
+    return cls(p_pin=p_pin, p_uv=p_uv, cpu_scale=cpu_scale)
 
 
 # Đăng ký ở cuối module để tránh import vòng (các model import `RuntimeModel`).

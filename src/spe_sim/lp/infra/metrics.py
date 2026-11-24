@@ -7,7 +7,9 @@ Các chỉ số:
     X         : throughput (req/s) — `completed / steady_window`
     E[r]      : thời gian đáp ứng trung bình của request **thành công** (ms)
     P95/P99   : phân vị thời gian đáp ứng (⚠ quy ước K10: linear interpolation)
-    P_loss    : `1 − completed/n_window` (gộp timeout + db_drop + dropped)
+    P_loss    : công thức (3) của spec: `(N_dropped + N_db-drop + N_timeout) / N_arrived`,
+                với N_arrived = số request có `t_arrive ∈ [t_warmup, t_end]` (C2).
+                Bản cũ (lọc theo `t_complete`) giữ ở `p_loss_by_completion` để đối chiếu.
     E[n]      : 2 cách đọc — Little (`X·E[r]`) và trung bình mẫu `n_in_system`
 
 ⚠ `n_in_system` trong `OutcomeNotice` là **ảnh chụp tại thời điểm chốt kết cục**, không
@@ -52,12 +54,19 @@ class MetricsRecorder:
         self.capacity_k = capacity_k
         self.n_total = 0
         self._window: list[OutcomeNotice] = []
+        # C2: N_arrived và số request mất, đếm theo **thời điểm đến** trong cửa sổ đo.
+        self.n_arrived = 0
+        self.n_lost = 0
 
     # ------------------------------------------------------------------ nạp
     def record(self, notice: OutcomeNotice) -> None:
         self.n_total += 1
         if notice.t_complete >= self.t_warmup:
             self._window.append(notice)
+        if self.t_warmup <= notice.t_arrive <= self.t_end:
+            self.n_arrived += 1
+            if notice.outcome is not Outcome.COMPLETED:
+                self.n_lost += 1
 
     def extend(self, notices: list[OutcomeNotice]) -> None:
         for notice in notices:
@@ -79,7 +88,8 @@ class MetricsRecorder:
 
         e_r_ms = sum(r_ms) / len(r_ms) if r_ms else None
         x_completed = len(r_ms) / self.steady_window_s
-        p_loss = (n_window - len(r_ms)) / n_window if n_window else None
+        p_loss = self.n_lost / self.n_arrived if self.n_arrived else None
+        p_loss_by_completion = (n_window - len(r_ms)) / n_window if n_window else None
 
         sampled_n = [n.n_in_system for n in window]
         return {
@@ -98,7 +108,9 @@ class MetricsRecorder:
             "p95_ms": sample_percentile(r_ms, 0.95) if r_ms else None,
             "p99_ms": sample_percentile(r_ms, 0.99) if r_ms else None,
             "max_r_ms": r_ms[-1] if r_ms else None,
+            "n_arrived": self.n_arrived,
             "p_loss": p_loss,
+            "p_loss_by_completion": p_loss_by_completion,
             "e_n_little": (x_completed * e_r_ms / MS_PER_S) if e_r_ms is not None else None,
             "e_n_sampled": (sum(sampled_n) / len(sampled_n)) if sampled_n else None,
             "max_n_in_system": max(sampled_n) if sampled_n else 0,

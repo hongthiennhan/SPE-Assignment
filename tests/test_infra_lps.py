@@ -378,6 +378,19 @@ class TestMetricsRecorder(unittest.TestCase):
         self.assertAlmostEqual(s["e_n_little"], 0.2 * 0.020)
         self.assertAlmostEqual(s["p95_ms"], 29.0)  # linear interpolation giữa 10 và 30
 
+    def test_p_loss_counts_by_arrival_time(self) -> None:
+        """C2: P_loss = mất / N_arrived theo `t_arrive` (spec công thức 3)."""
+        m = MetricsRecorder(t_warmup=10.0, t_end=20.0)
+        m.record(_notice(0, Outcome.TIMEOUT, 9.9, 10.2))  # đến trước warm-up: không tính
+        m.record(_notice(1, Outcome.COMPLETED, 12.0, 12.05))
+        m.record(_notice(2, Outcome.DROPPED, 15.0, 15.0))
+        m.record(_notice(3, Outcome.COMPLETED, 19.9, 20.1))  # đến trong cửa sổ, xong sau
+        s = m.summary()
+        self.assertEqual(s["n_arrived"], 3)
+        self.assertAlmostEqual(s["p_loss"], 1 / 3)
+        # Bản cũ lọc theo t_complete ⇒ tính cả request đến trước warm-up.
+        self.assertAlmostEqual(s["p_loss_by_completion"], 2 / 4)
+
     def test_empty_window(self) -> None:
         s = MetricsRecorder(0.0, 10.0).summary()
         self.assertEqual(s["n_window"], 0)

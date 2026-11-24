@@ -69,6 +69,12 @@ LAMBDA_LEVELS: tuple[float, ...] = (50, 100, 150, 200, 250, 300, 350, 400, 450)
 N_DB_LEVELS: tuple[int, ...] = (10, 16, 24)
 P_PIN_LEVELS: tuple[float, ...] = (0.0, 0.05, 0.20)
 P_UV_LEVELS: tuple[float, ...] = (0.0, 0.15, 0.30)
+#: Hệ số nhân chi phí CPU vòng lặp của Node.js/Bun — kịch bản Head-of-Line (spec §3.2).
+CPU_SCALE_LEVELS: tuple[float, ...] = (1.0, 2.0)
+#: Mức tải của phân tích độ nhạy (B1): tải danh định + vùng tải cao λ ≥ 200 (spec §2.1.3).
+SENSITIVITY_LAMBDA_LEVELS: tuple[float, ...] = (150, 300, 400, 450)
+#: Mức tải của kịch bản Head-of-Line `cpu_scale = 2` (B2).
+HOL_LAMBDA_LEVELS: tuple[float, ...] = (150, 300)
 
 UV_POOL_CHANNELS: int = 4  # c_uv = 4
 UV_POOL_SERVICE_S: float = 12.0 * MS
@@ -84,6 +90,10 @@ RuntimeModelName = Literal[
     "spring_loom_vt",
 ]
 JoinMode = Literal["gather", "as_completed"]
+#: Phân phối thời gian CPU mỗi request: "exp" cho Stochastic Workload (spec §1.5.1),
+#: "det" cho Deterministic Verification Workload (trace 63.50 / 29.50 / 24.50 ms).
+CpuDist = Literal["exp", "det"]
+CPU_DISTS: tuple[str, ...] = ("exp", "det")
 
 # Tên LP cố định — dùng làm `Emission.destination`, driver tra bảng này
 LP_SOURCE: str = "source"
@@ -229,8 +239,15 @@ PROFILES: dict[str, RuntimeProfile] = {
 LOOM_CAPACITY_PPIN20_RPS: float = 389.59
 
 
-def get_profile(name: str, *, p_pin: float = 0.0, p_uv: float = 0.0) -> RuntimeProfile:
-    """Lấy profile runtime và áp các tham số study factor (p_pin, p_uv)."""
+def get_profile(
+    name: str, *, p_pin: float = 0.0, p_uv: float = 0.0, cpu_scale: float = 1.0
+) -> RuntimeProfile:
+    """Lấy profile runtime và áp các tham số study factor (p_pin, p_uv, cpu_scale).
+
+    `cpu_scale` nhân chi phí CPU vòng lặp (cả hai pha) của Node.js/Bun — kịch bản "tăng gấp
+    đôi tải CPU vòng lặp" để quan sát Head-of-Line blocking (spec §3.2). Trần lý thuyết
+    giảm theo cùng hệ số.
+    """
     try:
         base = PROFILES[name]
     except KeyError as exc:  # pragma: no cover - lỗi lập trình
@@ -241,6 +258,12 @@ def get_profile(name: str, *, p_pin: float = 0.0, p_uv: float = 0.0) -> RuntimeP
         raise ValueError(f"p_pin phải trong [0, 1], nhận {p_pin}")
     if p_uv < 0.0 or p_uv > 1.0:
         raise ValueError(f"p_uv phải trong [0, 1], nhận {p_uv}")
+    if cpu_scale <= 0.0:
+        raise ValueError(f"cpu_scale phải > 0, nhận {cpu_scale}")
+    if cpu_scale != 1.0 and base.kind != "event_loop":
+        raise ValueError(
+            f"cpu_scale chỉ áp cho Node.js/Bun (event loop), {name!r} nhận {cpu_scale}"
+        )
     if base.uv_pool is None:
         uv = None
     else:
@@ -254,9 +277,9 @@ def get_profile(name: str, *, p_pin: float = 0.0, p_uv: float = 0.0) -> RuntimeP
         label=base.label,
         kind=base.kind,
         channels=base.channels,
-        cpu_total_s=base.cpu_total_s,
-        ingress_s=base.ingress_s,
-        callback_s=base.callback_s,
+        cpu_total_s=base.cpu_total_s * cpu_scale,
+        ingress_s=base.ingress_s * cpu_scale,
+        callback_s=base.callback_s * cpu_scale,
         holds_slot_during_io=base.holds_slot_during_io,
         sequential_branches=base.sequential_branches,
         carrier_hold_s=base.carrier_hold_s if p_pin > 0.0 else 0.0,
@@ -264,7 +287,7 @@ def get_profile(name: str, *, p_pin: float = 0.0, p_uv: float = 0.0) -> RuntimeP
         theoretical_capacity_rps=(
             LOOM_CAPACITY_PPIN20_RPS
             if base.name == "spring_loom_vt" and abs(p_pin - 0.20) < 1e-9
-            else base.theoretical_capacity_rps
+            else base.theoretical_capacity_rps / cpu_scale
         ),
     )
 
@@ -287,6 +310,8 @@ class ScenarioConfig:
     t_warmup: float = T_WARMUP_S
     capacity_k: int = ADMISSION_CAPACITY_K
     t_timeout: float = T_TIMEOUT_S
+    cpu_dist: CpuDist = "exp"
+    cpu_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.runtime_model not in RUNTIME_MODELS:
@@ -311,10 +336,18 @@ class ScenarioConfig:
             raise ValueError(f"t_timeout phải > 0, nhận {self.t_timeout}")
         if self.seed < 0:
             raise ValueError(f"seed phải ≥ 0, nhận {self.seed}")
+        if self.cpu_dist not in CPU_DISTS:
+            raise ValueError(f"cpu_dist phải thuộc {CPU_DISTS}, nhận {self.cpu_dist!r}")
+        if self.cpu_scale not in CPU_SCALE_LEVELS:
+            raise ValueError(f"cpu_scale phải thuộc {CPU_SCALE_LEVELS}, nhận {self.cpu_scale}")
+        # get_profile kiểm thêm: cpu_scale ≠ 1 chỉ hợp lệ với Node.js/Bun.
+        self.profile  # noqa: B018 - gọi để kiểm ràng buộc ngay lúc tạo
 
     @property
     def profile(self) -> RuntimeProfile:
-        return get_profile(self.runtime_model, p_pin=self.p_pin, p_uv=self.p_uv)
+        return get_profile(
+            self.runtime_model, p_pin=self.p_pin, p_uv=self.p_uv, cpu_scale=self.cpu_scale
+        )
 
     @property
     def steady_state_s(self) -> float:
@@ -334,4 +367,6 @@ class ScenarioConfig:
             "t_warmup": self.t_warmup,
             "capacity_k": self.capacity_k,
             "t_timeout": self.t_timeout,
+            "cpu_dist": self.cpu_dist,
+            "cpu_scale": self.cpu_scale,
         }

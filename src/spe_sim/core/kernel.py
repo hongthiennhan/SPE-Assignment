@@ -38,6 +38,7 @@ BA QUYẾT ĐỊNH CẤU HÌNH (xem `report.md` §9.4 để biết lý do)
 
 from __future__ import annotations
 
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -409,16 +410,22 @@ class SequentialKernel:
         return float(self.dispatcher.current_time)
 
 
+def _ignore_parked_lps(record: logging.LogRecord) -> bool:
+    """Bộ lọc log: bỏ cảnh báo "stranded LPs" do LP đậu có chủ ý (xem `CoroutineKernel.run`)."""
+    return "stranded LPs" not in record.getMessage()
+
+
 class CoroutineKernel:
     """Chạy cùng một tập LP trên `BkSysCoEventLoop` — **asyncio**, đúng spec §1.1.2.
 
-    Khác `SequentialKernel` ở chỗ: event loop là coroutine (`asyncio.run`), mỗi LP là một
-    `coroutine_run`, và dispatcher dùng `asyncio.Future` + `asyncio.gather`/
-    `as_completed` (`CoroutineDispatcherLP`). Dùng để đối chứng cơ chế với bản đồng bộ;
-    kết quả số phải trùng khớp.
+    Khác `SequentialKernel` ở chỗ: event loop là coroutine (chạy qua `asyncio.Runner`,
+    spec §1.1.2 — bản vá FIX-4 trong `vendor/`), mỗi LP là một `coroutine_run`, và
+    dispatcher dùng `asyncio.Future` + `asyncio.gather`/`as_completed`
+    (`CoroutineDispatcherLP`). Dùng để đối chứng cơ chế với bản đồng bộ; kết quả số phải
+    trùng khớp.
 
-    Cảnh báo: loop này dùng `asyncio.wait_for` khi `wait_for_event(..., timeout=...)` —
-    không dùng timeout wall-clock trong mô phỏng của ta (DEV.md §2).
+    Timeout của `wait_for_event(..., timeout=...)` là bộ hẹn giờ trên **thời gian ảo**
+    (bản vá FIX-3), không phải wall-clock (DEV.md §2). Yêu cầu Python ≥ 3.11.
     """
 
     def __init__(
@@ -482,7 +489,16 @@ class CoroutineKernel:
         return emit
 
     def run(self) -> dict[str, Any]:
-        return self.loop.run()
+        # Sau FIX-2, framework cảnh báo "stranded LPs" khi hết event mà còn LP chưa kết thúc.
+        # Ở đây đó là chủ ý: `CoroutineAdapter` đậu ở `end_time + 1` và dispatcher chờ
+        # `Admitted` mãi mãi. Lọc riêng thông điệp này; mất request thật sẽ bị bất biến
+        # ΔN = 0 (`tests/verify_invariants.py`) bắt.
+        framework_logger = logging.getLogger("bkitevsim.core.logical_coProcess")
+        framework_logger.addFilter(_ignore_parked_lps)
+        try:
+            return self.loop.run()
+        finally:
+            framework_logger.removeFilter(_ignore_parked_lps)
 
     def make_emit(self, sender_id: int):
         """Hàm phát `Emission` từ ngoài (dùng cho test/harness nạp sự kiện ban đầu)."""
