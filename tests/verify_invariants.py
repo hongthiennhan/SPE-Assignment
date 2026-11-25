@@ -7,10 +7,16 @@ Kiểm trên mỗi kịch bản:
     1 kết cục / request   : số notice = số admitted, không trùng request_id
     3.0 × N_admitted      : branch_requests = 3 × admitted
     causality/monotonic   : t_arrive ≤ t_dispatch ≤ t_complete, không lùi thời gian
-    Little's Law          : |E[N] − X·E[r]| / E[N] ≤ 10 %  (spec §1.5.2)
+    Little's Law          : |E[N] − λ_eff·E[r]| / E[N] ≤ 1 %  (spec §1.5.2)
+                            với λ_eff = admitted / span = X (req/s) của cùng cửa sổ đo
 
 `E[N]` lấy từ tích phân `N(t)` của dispatcher (`mean_in_system`), không phải trung bình mẫu
 tại thời điểm chốt kết cục — hai thứ này khác nhau và chỉ cái đầu đúng cho Little.
+
+Ngưỡng 1 % là con số của spec §1.5.2 (“sai lệch Little's Law E[n] = λ_eff·E[r] ≤ 1 %”).
+Với cách đo này đẳng thức gần như chính xác về mặt đại số (∫N(t)dt = Σ sojourn), nên 1 %
+thực chất chỉ bắt lỗi **hạch toán**: quên cộng diện tích khi N(t) đổi, cộng sai một request,
+hoặc lệch cửa sổ đo giữa X và E[r]. Trước đây để 10 % nên các lỗi đó vẫn lọt.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ from spe_sim.lp.infra.uv_pool import UvWorkerPoolLP  # noqa: E402
 from spe_sim.lp.infra.source import SourceLP  # noqa: E402
 from spe_sim.lp.runtime.models.base import build_model  # noqa: E402
 
-LITTLE_TOLERANCE = 0.10
+LITTLE_TOLERANCE = 0.01
 
 
 @dataclass(frozen=True)
@@ -137,14 +143,24 @@ def evaluate(scenario: Scenario, engine: str = "sequential") -> tuple[list[str],
     if not notices:
         return ["không có kết cục nào"], {}
 
+    row_deviation = 0.0
+
     # Cửa sổ đo = toàn bộ thời gian kernel chạy, để X và E[N] cùng một khoảng.
     span = max(dispatcher.last_time, source.t_sim, kernel.current_time)
     r_s = sum((n.t_complete - n.t_arrive) for n in notices) / len(notices)
     x_rps = admission.admitted / span
     mean_n = dispatcher.mean_in_system(span)
     little = x_rps * r_s
-    if mean_n > 1e-9 and abs(mean_n - little) / mean_n > LITTLE_TOLERANCE:
-        problems.append(f"Little: E[N]={mean_n:.3f} vs X·E[r]={little:.3f}")
+    # Chia cho max(...) để không khuếch đại sai số tương đối khi hệ gần rỗng (E[N] → 0).
+    scale = max(mean_n, little)
+    if scale > 1e-9:
+        deviation = abs(mean_n - little) / scale
+        row_deviation = deviation
+        if deviation > LITTLE_TOLERANCE:
+            problems.append(
+                f"Little: E[N]={mean_n:.4f} vs λ_eff·E[r]={little:.4f} "
+                f"(lệch {100 * deviation:.2f} % > {100 * LITTLE_TOLERANCE:g} %)"
+            )
 
     row: dict[str, float | int] = {
         "admitted": admission.admitted,
@@ -152,6 +168,7 @@ def evaluate(scenario: Scenario, engine: str = "sequential") -> tuple[list[str],
         "e_r_ms": r_s / MS,
         "e_n": mean_n,
         "x_rps": x_rps,
+        "little_dev_pct": 100.0 * row_deviation,
     }
     return problems, row
 
@@ -159,9 +176,9 @@ def evaluate(scenario: Scenario, engine: str = "sequential") -> tuple[list[str],
 def main() -> int:
     print(
         f"{'engine':<12}{'runtime':<22}{'join':<14}{'lambda':>7}{'p_pin':>7}{'p_uv':>6}"
-        f"{'adm':>6}{'drop':>6}{'E[r]ms':>9}{'E[N]':>8}{'status':>8}"
+        f"{'adm':>6}{'drop':>6}{'E[r]ms':>9}{'E[N]':>8}{'Little%':>9}{'status':>8}"
     )
-    print("-" * 112)
+    print("-" * 121)
     failures = 0
     rows: dict[tuple[str, Scenario], dict[str, float | int]] = {}
     for engine in ENGINES:
@@ -178,7 +195,7 @@ def main() -> int:
                 f"{engine:<12}{label:<22}{scenario.join_mode:<14}{scenario.lam:>7.0f}"
                 f"{scenario.p_pin:>7.2f}{scenario.p_uv:>6.2f}{row.get('admitted', 0):>6}"
                 f"{row.get('dropped', 0):>6}{row.get('e_r_ms', 0.0):>9.2f}"
-                f"{row.get('e_n', 0.0):>8.3f}{status:>8}"
+                f"{row.get('e_n', 0.0):>8.3f}{row.get('little_dev_pct', 0.0):>9.3f}{status:>8}"
             )
             for problem in problems:
                 print(f"    ↳ {problem}")
