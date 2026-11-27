@@ -41,6 +41,13 @@ py -3.12 -m spe_sim.validation --quick                   # chạy thử nhanh, k
 # Thí nghiệm mạng (lưới chính + độ nhạy) → CSV D3 mỗi kịch bản + summary.csv (mean ± CI 95 %)
 py -3.12 -m spe_sim.runner --out results/
 py -3.12 -m spe_sim.runner --out results/ --only spring_loom_vt -R 5 --t-sim 60   # chạy thử
+
+# Chạy ma trận thực nghiệm theo nhóm (hỗ trợ resume từ per_seed_metrics.csv) → summary_metrics_ci95.csv
+py -3.12 -m spe_sim.runner.run_study_matrix --out-dir results/final --group main --workers 8 --save-sample-seed -1
+py -3.12 -m spe_sim.runner.run_study_matrix --out-dir results/final --group sensitivity --workers 8 --save-sample-seed -1
+
+# Vẽ lại toàn bộ 9 biểu đồ đánh giá hiệu năng từ bảng tổng hợp CI 95%
+py -3.12 -m spe_sim.runner.plot_evaluation --summary-csv results/final/summary_metrics_ci95.csv --out-dir results/final/figures
 ```
 
 ## Cấu trúc
@@ -54,7 +61,9 @@ src/spe_sim/
                auth_cluster, catalog_service, db_pool, uv_pool, sinks, metrics
   lp/runtime/  dispatcher (bản đồng bộ), coroutine_dispatcher (asyncio — mặc định),
                models/ (4 runtime model)
-  runner/      study (dựng hệ thống, chạy lưới), deterministic (trace tất định), __main__ (CLI)
+  runner/      study (dựng hệ thống, chạy lưới), deterministic (trace tất định),
+               run_study_matrix (chạy theo nhóm + resume + CI 95%), plot_evaluation (9 biểu đồ),
+               __main__ (CLI)
   validation/  single_queue (6 hàng đợi trên LP của mạng), cpu_station (dispatcher cô lập),
                reference_server (bản tham chiếu độc lập), params, harness, __main__ (CLI)
 configs/scenarios.json   lưới chính 72 kịch bản + 192 kịch bản độ nhạy
